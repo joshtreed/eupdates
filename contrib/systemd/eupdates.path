@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh update count after emerge transactions
+
+[Path]
+# portage rewrites its mtimedb on every merge/unmerge, and it's world-readable
+# (root:portage, mode 644) -- so watching it needs no special group and no root
+# config. `emerge --pretend` (what `eupdates check` runs) does NOT touch it, so
+# a check can't re-trigger itself.
+#
+# (Watching /var/db/pkg does not work: portage nests installs two levels deep --
+#  /var/db/pkg/<category>/<pkg-version>/ -- below what a directory watch sees.)
+PathModified=/var/cache/edb/mtimedb
+Unit=eupdates.service
+
+[Install]
+WantedBy=default.target

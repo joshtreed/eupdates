@@ -1,0 +1,39 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build (${{ matrix.cc }})
+        run: make CC=${{ matrix.cc }} CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -pedantic" eupdates
+      - name: smoke test
+        run: ./eupdates --version && ./eupdates --help
+
+  musl:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: apk add --no-cache build-base musl-dev
+      - name: build (musl)
+        run: make CC=gcc CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -pedantic" eupdates
+      - run: ./eupdates --version
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-format shellcheck scdoc
+      - name: clang-format
+        run: clang-format --dry-run -Werror src/*.c
+      - name: shellcheck contrib scripts
+        run: |
+          files=$(git ls-files 'contrib/**/*.sh')
+          [ -z "$files" ] || shellcheck $files
+      - name: man page builds
+        run: scdoc < doc/eupdates.1.scd > /dev/null

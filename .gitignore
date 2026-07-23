@@ -1,0 +1,11 @@
+# build artifacts
+/eupdates
+*.o
+*.a
+*.so
+# generated man page
+/doc/*.1
+# editor / tooling
+*.dSYM/
+compile_commands.json
+.cache/

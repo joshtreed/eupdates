@@ -1,0 +1,11 @@
+[Unit]
+Description=Count pending Gentoo package updates (eupdates)
+Documentation=man:eupdates(1)
+
+[Service]
+Type=oneshot
+# Offline: resolves the local synced tree only; never contacts a mirror.
+# Niced/idle-IO so the resolve stays off the desktop's toes.
+ExecStart=%h/.local/bin/eupdates check
+Nice=15
+IOSchedulingClass=idle
