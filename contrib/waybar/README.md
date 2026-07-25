@@ -19,7 +19,8 @@ Add a `custom/updates` module to `~/.config/waybar/config`:
 while it resolves; `--notify` pops a desktop notification when the count
 changes. Background refreshes (timer/`.path`) omit `--progress` so they stay
 silent, and take `--notify` only if you want them to (or set `EUPDATES_NOTIFY=1`
-in the unit).
+in the unit) — a background check reports only a count that *rose*, so your own
+emerges don't notify you about work you just did.
 
 Then reference `"custom/updates"` in one of your `modules-left/center/right`
 arrays.

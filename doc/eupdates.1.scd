@@ -48,10 +48,21 @@ the expensive dependency resolution only runs on *check*.
 	resolving, so *status* reports a *checking* class while the check runs.
 	Intended for manual (clicked) checks; background refreshes omit it.
 
+*--settle* _SECONDS_
+	For *check*: before resolving, wait until portage's _mtimedb_
+	(/var/cache/edb/mtimedb) has gone _SECONDS_ without a write; any write
+	during the wait restarts it. portage rewrites that file once per merged
+	package, so this collapses a whole emerge into a single resolve afterwards
+	rather than one per package. Intended for a path-unit-triggered *check*;
+	0 (the default) disables it. A single package that builds for longer than
+	_SECONDS_ can still let one resolve through mid-emerge.
+
 *--notify*
 	For *check*/*upgrade*: send a desktop notification (via *notify-send*) when
-	the pending count changes. A manual check (*--progress*) also notifies when
-	nothing changed. A no-op if *notify-send* is not installed.
+	the pending count changes. A background check reports only a count that rose
+	(or the first count seen): a count that fell is the result of an emerge the
+	user just ran, so it is not news. A manual check (*--progress*) reports every
+	outcome, including no change. A no-op if *notify-send* is not installed.
 
 *--no-notify*
 	Suppress notifications, overriding *EUPDATES_NOTIFY*.
@@ -65,8 +76,8 @@ the expensive dependency resolution only runs on *check*.
 # ENVIRONMENT
 
 *EUPDATES_NOTIFY*
-	When set to a non-empty value other than *0*, *check* notifies on a changed
-	count as if *--notify* were given.
+	When set to a non-empty value other than *0*, *check* notifies as if
+	*--notify* were given (see it for which changes are reported).
 
 *EUPDATES_ICON*
 	Icon for notifications: an XDG icon-theme name (e.g. *system-software-update*,

@@ -88,7 +88,8 @@ See `contrib/polybar/`, `contrib/i3blocks/`, `contrib/tmux/`.
 | `check`         | Resolve `@world`, refresh cache, signal waybar.     |
 | `upgrade`       | Interactive `emerge` upgrade in `$TERMINAL`.         |
 | `--progress`    | On `check`/`upgrade`: show a "checking" state in the bar while resolving. |
-| `--notify`      | On `check`/`upgrade`: desktop-notify (via `notify-send`) when the count changes; a manual check also confirms when nothing changed. |
+| `--settle SECS` | On `check`: wait for portage's `mtimedb` to be quiet for `SECS` before resolving, so one emerge yields one resolve instead of one per package. `0` (default) disables. |
+| `--notify`      | On `check`/`upgrade`: desktop-notify (via `notify-send`) when the count changes. A background check reports only a count that *rose*; a manual check reports every outcome, including no change. |
 | `--no-notify`   | Suppress notifications (overrides `EUPDATES_NOTIFY`). |
 | `-h`, `--help`  | Usage.                                              |
 | `-V`, `--version` | Version.                                          |

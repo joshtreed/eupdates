@@ -6,6 +6,13 @@ Documentation=man:eupdates(1)
 Type=oneshot
 # Offline: resolves the local synced tree only; never contacts a mirror.
 # Niced/idle-IO so the resolve stays off the desktop's toes.
-ExecStart=%h/.local/bin/eupdates check
+#
+# --settle waits for portage to go quiet before resolving. Without it the .path
+# unit is a treadmill: portage rewrites mtimedb once per merged package, the
+# resolve takes minutes, and the path unit re-arms the instant this service
+# exits -- so a long emerge spawns resolves back-to-back for its whole duration,
+# competing with the compile. Settling collapses that to one resolve afterwards.
+# (Type=oneshot means TimeoutStartSec is infinity, so a long wait is safe.)
+ExecStart=%h/.local/bin/eupdates check --settle 300
 Nice=15
 IOSchedulingClass=idle

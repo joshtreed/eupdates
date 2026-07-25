@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `--settle SECONDS` for `check`: wait until portage's `mtimedb` has been
+  quiet that long before resolving. A `.path` unit watching `mtimedb` re-arms
+  as soon as the check it triggered exits, and portage rewrites that file once
+  per merged package, so an emerge used to spawn a back-to-back resolve every
+  ~2 minutes for its entire duration. Settling collapses that to one resolve
+  after the emerge finishes.
+
+### Changed
+- A background (timer/path) `check` now notifies only when the pending count
+  *rises*, or on the first count seen. A count that fell is the result of an
+  emerge the user just ran by hand, so announcing it was pure noise — a
+  five-package emerge produced five notifications. A manual (`--progress`)
+  check is unchanged and still reports every outcome.
+
 ### Planned (hardening toward 1.0.0)
 - Replace `popen`/`/bin/sh` with `execve` and an explicitly scrubbed
   environment (`LC_ALL=C`, `COLUMNS=1000`, `EMERGE_DEFAULT_OPTS=`, `NOCOLOR`)

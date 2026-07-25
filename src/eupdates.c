@@ -36,6 +36,12 @@ static const char *EMERGE_CMD =
 /* Offline: reads the local GLSA metadata shipped with the tree. */
 static const char *GLSA_CMD = "glsa-check --test affected 2>/dev/null";
 static const char *TREE_TS = "/var/db/repos/gentoo/metadata/timestamp.chk";
+/* Rewritten by portage once per merge/unmerge; what --settle waits out.
+ * Overridable at build time so the settle path can be tested without root. */
+#ifndef EUPDATES_MTIMEDB
+#define EUPDATES_MTIMEDB "/var/cache/edb/mtimedb"
+#endif
+static const char *MTIMEDB = EUPDATES_MTIMEDB;
 
 static const char *ICON = "\xf3\xb0\x8f\x97";       /* U+F03D7 nf-md-package_up */
 static const char *CHECK_ICON = "\xf3\xb0\x91\x90"; /* U+F0450 nf-md-refresh   */
@@ -200,10 +206,16 @@ static int notify_enabled(int cli_notify, int cli_no_notify) {
     return e && *e && strcmp(e, "0") != 0;
 }
 
-/* Compare old vs new pending count and notify per the rules: on any change, and
- * additionally (for a manual check) confirm even when nothing changed. */
+/* Compare old vs new pending count and notify per the rules.
+ *
+ * A background refresh (timer or path unit) reports only a count that ROSE, or
+ * the first-ever count: a count that fell is the result of an emerge the user
+ * just ran by hand, so announcing it tells them something they already know.
+ * A manual check reports every outcome, "no change" included, because it was
+ * asked for. */
 static void notify_result(int old, int now, int manual) {
     char body[128];
+    if (!manual && old >= 0 && now <= old) return;
     if (old != now) {
         if (now == 0)
             snprintf(body, sizeof body, "System up to date");
@@ -222,7 +234,27 @@ static void notify_result(int old, int now, int manual) {
     }
 }
 
-static int cmd_check(int progress, int notify) {
+/* Block until portage's mtimedb has gone `secs` seconds without a write.
+ *
+ * portage rewrites mtimedb once per merged package, and a .path unit re-arms as
+ * soon as the service it triggers exits -- so a bare path-triggered check turns
+ * one long emerge into a back-to-back resolve treadmill that competes with the
+ * compile. Waiting here instead keeps this unit active (which is what holds the
+ * path unit off) and costs nothing while it waits, so an emerge of any length
+ * yields exactly one resolve, once it is done. */
+static void settle(int secs) {
+    struct stat st;
+    for (;;) {
+        if (stat(MTIMEDB, &st) != 0) return; /* absent or unreadable: nothing to wait on */
+        time_t age = time(NULL) - st.st_mtime;
+        if (age < 0) age = 0; /* clock skew: treat a future mtime as "just now" */
+        if (age >= secs) return;
+        sleep((unsigned)(secs - age));
+    }
+}
+
+static int cmd_check(int progress, int notify, int settle_secs) {
+    if (settle_secs > 0) settle(settle_secs);
     ensure_cache_dir();
     char list[512], tmp[512], sec[512], mark[512], tmpleaf[64];
     cache_path(list, sizeof list, "list");
@@ -439,7 +471,8 @@ static int cmd_upgrade(int progress, int notify) {
         int st;
         waitpid(pid, &st, 0);
     }
-    return cmd_check(progress, notify);
+    /* No settle: the emerge this just ran is over, and the user is watching. */
+    return cmd_check(progress, notify, 0);
 }
 
 /* ---- main ---------------------------------------------------------------- */
@@ -458,6 +491,7 @@ static void usage(FILE *out, const char *prog) {
             "\n"
             "Options (for check / upgrade):\n"
             "  --progress     show a \"checking\" state in the bar while resolving\n"
+            "  --settle SECS  wait for portage to be idle SECS before resolving\n"
             "  --notify       desktop-notify when the pending count changes\n"
             "  --no-notify    suppress notifications (overrides EUPDATES_NOTIFY)\n"
             "  -h, --help     show this help and exit\n"
@@ -474,7 +508,7 @@ static void usage(FILE *out, const char *prog) {
 
 int main(int argc, char **argv) {
     const char *cmd = NULL;
-    int progress = 0, cli_notify = 0, cli_no_notify = 0;
+    int progress = 0, cli_notify = 0, cli_no_notify = 0, settle_secs = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
@@ -487,6 +521,18 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--progress") == 0) {
             progress = 1;
+        } else if (strcmp(a, "--settle") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "eupdates: --settle requires SECONDS\n");
+                return 2;
+            }
+            char *end;
+            long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 0 || v > 86400) {
+                fprintf(stderr, "eupdates: --settle: bad value '%s'\n", argv[i]);
+                return 2;
+            }
+            settle_secs = (int)v;
         } else if (strcmp(a, "--notify") == 0) {
             cli_notify = 1;
         } else if (strcmp(a, "--no-notify") == 0) {
@@ -506,7 +552,7 @@ int main(int argc, char **argv) {
 
     int notify = notify_enabled(cli_notify, cli_no_notify);
     if (strcmp(cmd, "status") == 0) return cmd_status();
-    if (strcmp(cmd, "check") == 0) return cmd_check(progress, notify);
+    if (strcmp(cmd, "check") == 0) return cmd_check(progress, notify, settle_secs);
     if (strcmp(cmd, "upgrade") == 0) return cmd_upgrade(progress, notify);
     fprintf(stderr, "eupdates: unknown command '%s'\n", cmd);
     usage(stderr, argv[0]);

@@ -16,10 +16,14 @@ systemctl --user enable --now eupdates.timer eupdates.path
   special group and no root configuration**. `emerge --pretend` (what a check
   runs) doesn't touch it, so a check can't re-trigger itself.
 
-  It may fire a couple of times during a large `@world` upgrade; the runs are
-  `Nice`/idle-IO and settle on the correct count after the last one. Watching
-  `/var/db/pkg` does *not* work — portage nests installs
-  (`/var/db/pkg/<category>/<pkg>/`) one level below what a directory watch sees.
+  On its own this misbehaves during a large `@world` upgrade: portage rewrites
+  `mtimedb` once per merged package, a resolve takes a couple of minutes, and a
+  `.path` unit re-arms as soon as the service it triggered exits — so the check
+  runs back-to-back for the entire upgrade, competing with the compile. That is
+  what `--settle 300` in `eupdates.service` is for: it waits for portage to go
+  quiet first, so one emerge costs one resolve. Watching `/var/db/pkg` does
+  *not* work — portage nests installs (`/var/db/pkg/<category>/<pkg>/`) one
+  level below what a directory watch sees.
 
 Neither ever syncs the portage tree. Keeping the tree fresh (`emerge --sync`)
 is a separate, privileged, rate-limited job you control — sync no more than
