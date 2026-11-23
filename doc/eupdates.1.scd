@@ -39,16 +39,7 @@ the expensive dependency resolution only runs on *check*.
 
 *upgrade*
 	Launch *$TERMINAL* running an interactive *emerge* upgrade of *@world*,
-	then re-run *check*. When that emerge exits 0, it also runs *world-done*.
-
-*world-done* [_EPOCH_]
-	Record that a *@world* upgrade finished now, or at _EPOCH_ (seconds since
-	1970). *status* shows the age of that record in the tooltip ("last @world
-	upgrade N days ago"). portage's own record, _/var/log/emerge.log_, is
-	readable only by root and the _portage_ group, so eupdates keeps its own
-	in the cache file _last-world_. Call this from any upgrade script that
-	does not go through *upgrade*; run it as the user whose cache the status
-	bar reads (for example *sudo -u "$SUDO_USER" -H eupdates world-done*).
+	then re-run *check*.
 
 # OPTIONS
 
