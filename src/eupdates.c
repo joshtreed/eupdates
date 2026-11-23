@@ -369,6 +369,52 @@ static int tree_age_days(void) {
     return d < 0 ? 0 : (int)d;
 }
 
+/* ---- last @world upgrade ------------------------------------------------ */
+
+/* When the last @world upgrade finished, as epoch seconds in the cache file
+ * "last-world". portage's own record (emerge.log) is readable only by root and
+ * the portage group, so eupdates keeps its own: `upgrade` writes it when its
+ * emerge exits 0, and `world-done` lets any other upgrade script write it. */
+static time_t read_last_world(void) {
+    char path[512];
+    cache_path(path, sizeof path, "last-world");
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    long long v = 0;
+    if (fscanf(fp, "%lld", &v) != 1 || v <= 0) v = 0;
+    fclose(fp);
+    return (time_t)v;
+}
+
+static int cmd_world_done(const char *arg) {
+    time_t when = time(NULL);
+    if (arg) {
+        char *end;
+        long long v = strtoll(arg, &end, 10);
+        if (*end || v <= 0 || (time_t)v > when) {
+            fprintf(stderr, "eupdates: world-done: bad epoch '%s'\n", arg);
+            return 2;
+        }
+        when = (time_t)v;
+    }
+    ensure_cache_dir();
+    char path[512], tmp[560];
+    cache_path(path, sizeof path, "last-world");
+    snprintf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid());
+    FILE *fp = fopen(tmp, "w");
+    if (!fp || fprintf(fp, "%lld\n", (long long)when) < 0 || fclose(fp) != 0) {
+        fprintf(stderr, "eupdates: write %s: %s\n", tmp, strerror(errno));
+        unlink(tmp);
+        return 1;
+    }
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "eupdates: rename %s: %s\n", path, strerror(errno));
+        unlink(tmp);
+        return 1;
+    }
+    return 0;
+}
+
 static int cmd_status(void) {
     char list[512], sec[512], mark[512];
     cache_path(list, sizeof list, "list");
@@ -411,6 +457,18 @@ static int cmd_status(void) {
     else
         fprintf(tb, "%d update%s pending \xe2\x80\xa2 checked %s", count,
                 count == 1 ? "" : "s", checked);
+
+    time_t lw = read_last_world();
+    if (lw > 0) {
+        double d = difftime(time(NULL), lw) / 86400.0;
+        int days = d < 0 ? 0 : (int)d;
+        if (days == 0)
+            fputs("\nlast @world upgrade today", tb);
+        else
+            fprintf(tb, "\nlast @world upgrade %d day%s ago", days, days == 1 ? "" : "s");
+    } else {
+        fputs("\nlast @world upgrade: not recorded yet", tb);
+    }
 
     if (glsa > 0)
         fprintf(tb, "\n\xef\x80\xa3 %d unresolved GLSA%s (run glsa-check)", glsa,
@@ -460,12 +518,20 @@ static int cmd_status(void) {
 static int cmd_upgrade(int progress, int notify) {
     const char *term = getenv("TERMINAL");
     if (!term || !*term) term = "xterm";
+    /* $0 inside the shell is this binary, so a clean emerge records itself. */
+    char self[4096];
+    ssize_t sn = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sn <= 0)
+        snprintf(self, sizeof self, "eupdates");
+    else
+        self[sn] = '\0';
     pid_t pid = fork();
     if (pid == 0) {
         execlp(term, term, "-e", "sh", "-c",
-               "sudo emerge --ask --verbose --update --deep --newuse @world; "
+               "sudo emerge --ask --verbose --update --deep --newuse @world "
+               "&& \"$0\" world-done; "
                "printf '\\nDone \\xe2\\x80\\x94 press enter to close.'; read _",
-               (char *)NULL);
+               self, (char *)NULL);
         _exit(127);
     } else if (pid > 0) {
         int st;
@@ -488,6 +554,8 @@ static void usage(FILE *out, const char *prog) {
             "  status    emit waybar JSON from the cache (default; instant)\n"
             "  check     resolve @world, refresh the cache, signal waybar\n"
             "  upgrade   run the upgrade in $TERMINAL, then re-check\n"
+            "  world-done [EPOCH]  record that a @world upgrade finished now (or at\n"
+            "            EPOCH); for upgrade scripts that don't go through `upgrade`\n"
             "\n"
             "Options (for check / upgrade):\n"
             "  --progress     show a \"checking\" state in the bar while resolving\n"
@@ -507,7 +575,7 @@ static void usage(FILE *out, const char *prog) {
 }
 
 int main(int argc, char **argv) {
-    const char *cmd = NULL;
+    const char *cmd = NULL, *arg = NULL;
     int progress = 0, cli_notify = 0, cli_no_notify = 0, settle_secs = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -543,6 +611,8 @@ int main(int argc, char **argv) {
             return 2;
         } else if (!cmd) {
             cmd = a;
+        } else if (!arg && strcmp(cmd, "world-done") == 0) {
+            arg = a;
         } else {
             fprintf(stderr, "eupdates: unexpected argument '%s'\n", a);
             return 2;
@@ -554,6 +624,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "status") == 0) return cmd_status();
     if (strcmp(cmd, "check") == 0) return cmd_check(progress, notify, settle_secs);
     if (strcmp(cmd, "upgrade") == 0) return cmd_upgrade(progress, notify);
+    if (strcmp(cmd, "world-done") == 0) return cmd_world_done(arg);
     fprintf(stderr, "eupdates: unknown command '%s'\n", cmd);
     usage(stderr, argv[0]);
     return 2;

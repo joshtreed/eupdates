@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `world-done [EPOCH]` and a "last @world upgrade N days ago" line in the
+  tooltip. `upgrade` records it when its emerge exits 0; other upgrade scripts
+  call `world-done` themselves. Stored as epoch seconds in the cache file
+  `last-world`, because portage's `emerge.log` is root/portage-group only.
 - `--settle SECONDS` for `check`: wait until portage's `mtimedb` has been
   quiet that long before resolving. A `.path` unit watching `mtimedb` re-arms
   as soon as the check it triggered exits, and portage rewrites that file once
