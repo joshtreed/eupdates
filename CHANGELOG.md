@@ -7,31 +7,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- `--settle SECONDS` for `check`: wait until portage's `mtimedb` has been
-  quiet that long before resolving. A `.path` unit watching `mtimedb` re-arms
-  as soon as the check it triggered exits, and portage rewrites that file once
-  per merged package, so an emerge used to spawn a back-to-back resolve every
-  ~2 minutes for its entire duration. Settling collapses that to one resolve
-  after the emerge finishes.
+- Works with any status bar, not just waybar.
+  - `watch`: keeps running and prints a line whenever the output changes, for
+    bars that stream a command (waybar without `interval`, polybar
+    `tail = true`, i3blocks `interval=persist`, eww `deflisten`, yambar).
+    Exits when the bar closes the pipe.
+  - `--format TEMPLATE` with `{count}`, `{glsa}`, `{synced}`, `{state}`.
+  - `--json`: one JSON object per line (waybar `return-type: json`).
+  - `list`: the pending packages, one per line.
+- Keeps itself current with no timer, cron job or service: `status` and
+  `watch` start one detached, low-priority background check when the tree was
+  synced, an emerge finished (`mtimedb` quiet for a minute), the world file
+  changed, or `EUPDATES_MAX_AGE` hours (default 24) went by. Never while
+  `emerge` or `emaint` runs.
+- `--no-auto` / `EUPDATES_AUTO=0` for people who schedule `check` themselves.
+- A lock, so only one check runs at a time however many bars and clicks ask.
+- A failed check counts as an attempt, so a broken tree is not retried in a
+  loop.
+- Test suite (`make test`) against a fake emerge; runs in CI on glibc and musl.
+- Integration guides for conky, dwm, eww, yambar and cron (`contrib/generic/`).
 
 ### Changed
-- A background (timer/path) `check` now notifies only when the pending count
-  *rises*, or on the first count seen. A count that fell is the result of an
-  emerge the user just ran by hand, so announcing it was pure noise — a
-  five-package emerge produced five notifications. A manual (`--progress`)
-  check is unchanged and still reports every outcome.
+- **Breaking:** the default output is now plain text (`{count}`), not waybar
+  JSON. waybar users add `--json`; see `contrib/waybar/`.
+- A background check notifies only when the pending count *rises*, or on the
+  first count seen. A count that fell is the result of an emerge you just ran.
+  `check` still reports every outcome.
+
+### Removed
+- **Breaking:** `--progress` (a manual `check` always shows the `checking`
+  state now), `EUPDATES_WAYBAR_SIGNAL` and waybar signalling (`watch` replaces
+  it), and the systemd units and `eupdates-count.sh` helper in `contrib/`.
 
 ### Planned (hardening toward 1.0.0)
 - Replace `popen`/`/bin/sh` with `execve` and an explicitly scrubbed
   environment (`LC_ALL=C`, `COLUMNS=1000`, `EMERGE_DEFAULT_OPTS=`, `NOCOLOR`)
   so a user's emerge defaults or locale can't reshape the parsed output.
 - Parse `emerge --columns` output (portage's most stable per-line format).
-- Generic output modes: bare integer (default), `--json`, `--format <tmpl>`,
-  `--list`, so eupdates works in polybar/i3blocks/tmux/conky without wrappers.
-- Broaden cache invalidation to every configured repo `timestamp.chk`,
-  `/var/db/pkg`, `/var/lib/portage/world`, and `/etc/portage`.
+- Notice syncs of every configured repo, not just the main tree, and changes
+  under `/etc/portage`.
 - Optional `eix` fast backend (auto-detected, labelled approximate).
-- musl CI leg.
 
 ## [0.1.0] - 2026-07-23
 

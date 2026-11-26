@@ -4,42 +4,31 @@ Add a `custom/updates` module to `~/.config/waybar/config`:
 
 ```jsonc
 "custom/updates": {
-    "format": "{}",
+    "exec": "eupdates watch --json --format '󰏗 {count}'",
     "return-type": "json",
-    "exec": "eupdates status",
-    "interval": 3600,
-    "signal": 8,
-    "on-click": "eupdates check --progress --notify",
+    "on-click": "eupdates check --notify",
     "on-click-right": "eupdates upgrade",
     "tooltip": true
 }
 ```
 
-`--progress` makes a manual (clicked) check show a "checking" state in the bar
-while it resolves; `--notify` pops a desktop notification when the count
-changes. Background refreshes (timer/`.path`) omit `--progress` so they stay
-silent, and take `--notify` only if you want them to (or set `EUPDATES_NOTIFY=1`
-in the unit) — a background check reports only a count that *rose*, so your own
-emerges don't notify you about work you just did.
+No `interval` and no `signal`: `eupdates watch` keeps running and prints a new
+line whenever the count changes, including after a sync or an emerge. Nothing
+else (timer, cron, service) is needed.
 
-Then reference `"custom/updates"` in one of your `modules-left/center/right`
-arrays.
+Clicking runs a check now; the module shows the `checking` class until it
+finishes, and `--notify` reports the result. Right-click opens an upgrade in
+`$TERMINAL`.
 
-Style it in `style.css`, e.g.:
+Then add `"custom/updates"` to one of your `modules-left/center/right` arrays.
+
+Style it in `style.css`:
 
 ```css
-#custom-updates {
-    padding: 0 8px;
-}
 #custom-updates.updated  { opacity: 0.6; }  /* nothing pending           */
 #custom-updates.pending  { }                /* updates waiting           */
 #custom-updates.checking { opacity: 0.6; }  /* a manual check is running */
-#custom-updates.unknown  { opacity: 0.4; }  /* no check yet              */
+#custom-updates.unknown  { opacity: 0.4; }  /* no check finished yet     */
 ```
 
-The module text carries a nerd-font package glyph, so use a nerd-font.
-
-`eupdates status` is cheap (reads the cache); the actual resolution happens on
-`check`. Drive `check` from the systemd units in `../systemd/` so the count
-refreshes on a timer and after every emerge, signalling waybar via
-`SIGRTMIN+8`. If you change `"signal"`, set `EUPDATES_WAYBAR_SIGNAL` to match.
+The format above uses a nerd-font glyph; use any text you like.
