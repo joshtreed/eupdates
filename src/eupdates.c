@@ -45,7 +45,7 @@
 #include <unistd.h>
 
 #ifndef EUPDATES_VERSION
-#define EUPDATES_VERSION "0.2.0"
+#define EUPDATES_VERSION "0.2.1"
 #endif
 
 /* Every system path is overridable at build time so the tests can run without

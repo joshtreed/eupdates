@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-26
+
+### Fixed
+- The test suite no longer fails when run from a portage ebuild, which sets
+  `PORTAGE_CONFIGROOT` in the environment.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added
@@ -85,6 +91,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Man page (`scdoc`), Makefile with `DESTDIR`/`PREFIX` support, example
   status-bar and systemd integration snippets.
 
-[Unreleased]: https://github.com/joshtreed/eupdates/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/joshtreed/eupdates/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/joshtreed/eupdates/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/joshtreed/eupdates/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/joshtreed/eupdates/releases/tag/v0.1.0
