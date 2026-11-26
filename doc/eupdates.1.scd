@@ -2,67 +2,105 @@ eupdates(1)
 
 # NAME
 
-eupdates - count pending Gentoo package updates for status bars
+eupdates - count pending Gentoo package updates, for any status bar
 
 # SYNOPSIS
 
-*eupdates* [_command_]
+*eupdates* [_command_] [_options_]
 
 # DESCRIPTION
 
-*eupdates* reports how many Gentoo (portage) packages have pending updates,
-for display in a status bar such as waybar, polybar, i3blocks or tmux.
+*eupdates* reports how many Gentoo (portage) packages have pending updates, for
+display in any status bar: waybar, polybar, i3blocks, eww, yambar, tmux, conky,
+a dwm status script, or anything else that shows a command's output.
 
 It resolves the update set with *emerge*(1) *--pretend* against the
-*already-synced* local portage tree and installed database only. It never
-contacts a mirror: the only mirror-hitting operation on Gentoo is
-*emerge --sync*, which *eupdates* deliberately does not perform. Keeping the
-tree fresh is left to a separate, rate-limited sync of the operator's choosing;
-the tooltip reports how stale the tree is as a reminder.
+*already-synced* local portage tree and installed database only, so the count
+matches what a real *emerge -uDN @world* would merge. It never contacts a
+mirror: the only mirror-hitting operation on Gentoo is *emerge --sync*, which
+*eupdates* deliberately does not perform.
 
-Results are cached under _$XDG_CACHE_HOME/eupdates_ so *status* is instant and
-the expensive dependency resolution only runs on *check*.
+That resolve takes as long as a real *emerge --pretend* (often a minute or two of
+CPU), so its result is cached under _$XDG_CACHE_HOME/eupdates_ and every display
+command only reads the cache.
+
+# KEEPING THE COUNT CURRENT
+
+No timer, cron job or init-system service is needed. Whenever *status* or
+*watch* runs, it checks (with a few *stat*(2) calls) whether the cache is out of
+date, and if so starts one detached, low-priority *check* in the background
+while showing the previous count. The cache is out of date when, since the last
+check:
+
+- the portage tree was synced;
+- an emerge finished (portage's _/var/cache/edb/mtimedb_ has been quiet for a
+  minute);
+- the world file changed; or
+- *EUPDATES_MAX_AGE* hours went by (default 24).
+
+No check starts while an *emerge* or *emaint* process is running, because its
+answer would be out of date before it landed. Only one check runs at a time,
+however many bars and clicks ask for one. A failed check counts as an attempt,
+so a broken tree is retried when something changes rather than continuously.
+
+To decide for yourself when checks run, pass *--no-auto* (or set
+*EUPDATES_AUTO=0*) and run *eupdates check* from cron, a timer or by hand, as
+the user whose bar shows the count (the cache is per user).
 
 # COMMANDS
 
 *status*
-	Emit waybar JSON (_text_, _tooltip_, _class_) from the cache. This is the
-	default when no command is given and does no resolution, so it is safe to
-	call on every status-bar poll. _class_ is *pending*, *updated*, *checking*
-	(a manual *--progress* check is in flight), or *unknown* (no check yet).
+	Print one line from the cache and exit. The default when no command is
+	given. Use it with bars that run a command on an interval.
+
+*watch*
+	Keep running and print a new line whenever the output changes: at start,
+	when a check finishes, while a manual check runs (state *checking*). Use
+	it with bars that read a long-running command's lines (waybar without
+	_interval_, polybar _tail = true_, i3blocks _interval=persist_, eww
+	_deflisten_, yambar _script_). Exits when the bar closes the pipe.
 
 *check*
-	Resolve the *@world* upgrade set, refresh the cache, and signal waybar to
-	redraw. This runs *emerge --pretend --update --deep --newuse @world* and
-	can take several seconds; run it from a timer or on demand, not on every
-	poll.
+	Resolve the *@world* upgrade set now and refresh the cache. While it
+	runs, *watch* reports state *checking*. If another check is already
+	running, says so and exits 0. Exits non-zero if *emerge* failed (for
+	example an unresolved blocker); the previous cache is then kept rather
+	than reporting zero updates.
+
+*list*
+	Print the cached list of pending packages, one per line, with the
+	installed version where there is one. For popups and menus.
 
 *upgrade*
 	Launch *$TERMINAL* running an interactive *emerge* upgrade of *@world*,
-	then re-run *check*.
+	then run *check*.
 
 # OPTIONS
 
-*--progress*
-	For *check*/*upgrade*: write a transient marker and signal waybar before
-	resolving, so *status* reports a *checking* class while the check runs.
-	Intended for manual (clicked) checks; background refreshes omit it.
+*--format* _TEMPLATE_
+	Output template for *status* and *watch*. Fields:
 
-*--settle* _SECONDS_
-	For *check*: before resolving, wait until portage's _mtimedb_
-	(/var/cache/edb/mtimedb) has gone _SECONDS_ without a write; any write
-	during the wait restarts it. portage rewrites that file once per merged
-	package, so this collapses a whole emerge into a single resolve afterwards
-	rather than one per package. Intended for a path-unit-triggered *check*;
-	0 (the default) disables it. A single package that builds for longer than
-	_SECONDS_ can still let one resolve through mid-emerge.
+	*{count}*   pending updates (*?* before the first check)++
+*{glsa}*    unresolved security advisories (needs *glsa-check*)++
+*{synced}*  days since the portage tree was synced++
+*{state}*   *pending*, *updated*, *checking* or *unknown*
+
+	Anything else is printed as is. Default: *{count}*.
+
+*--json*
+	Print one JSON object per line instead: _text_ (the template), _tooltip_
+	(summary and package list), _class_ and _alt_ (the state). This is the
+	shape waybar's _return-type: json_ expects.
+
+*--no-auto*
+	Never start a check on its own; see KEEPING THE COUNT CURRENT.
 
 *--notify*
-	For *check*/*upgrade*: send a desktop notification (via *notify-send*) when
-	the pending count changes. A background check reports only a count that rose
-	(or the first count seen): a count that fell is the result of an emerge the
-	user just ran, so it is not news. A manual check (*--progress*) reports every
-	outcome, including no change. A no-op if *notify-send* is not installed.
+	Send a desktop notification (via *notify-send*) when the pending count
+	changes. A background check reports only a count that rose (or the first
+	count seen): a count that fell is the result of an emerge you just ran,
+	so it is not news. *check* and *upgrade* report every outcome, including
+	no change. A no-op if *notify-send* is not installed.
 
 *--no-notify*
 	Suppress notifications, overriding *EUPDATES_NOTIFY*.
@@ -75,29 +113,46 @@ the expensive dependency resolution only runs on *check*.
 
 # ENVIRONMENT
 
+*EUPDATES_AUTO*
+	*0* has the same effect as *--no-auto*.
+
+*EUPDATES_MAX_AGE*
+	Start a check at least every this many hours (default: *24*).
+
 *EUPDATES_NOTIFY*
-	When set to a non-empty value other than *0*, *check* notifies as if
-	*--notify* were given (see it for which changes are reported).
+	When set to a non-empty value other than *0*, behave as if *--notify*
+	were given.
 
 *EUPDATES_ICON*
-	Icon for notifications: an XDG icon-theme name (e.g. *system-software-update*,
-	the default) or an absolute path to an image file.
+	Icon for notifications: an XDG icon-theme name (default:
+	*system-software-update*) or an absolute path to an image file.
 
 *TERMINAL*
 	Terminal emulator used by *upgrade* (default: *xterm*).
-
-*EUPDATES_WAYBAR_SIGNAL*
-	The *SIGRTMIN+N* signal number waybar listens on for this module
-	(default: *8*). Must match the module's _signal_ field.
 
 *XDG_CACHE_HOME*
 	Cache directory (default: _~/.cache/eupdates_).
 
 # EXIT STATUS
 
-*status* returns 0. *check* returns non-zero if the *emerge* resolution
-failed (for example an unresolved blocker); in that case the previous cache is
-left untouched rather than reporting zero updates.
+*status*, *watch* and *list* return 0 (*list* returns 1 before the first check).
+*check* and *upgrade* return non-zero if the resolve failed.
+
+# EXAMPLES
+
+Polling bar (tmux):
+
+	set -g status-right "#(eupdates --format 'pkg {count}')"
+
+Streaming bar (polybar):
+
+	exec = eupdates watch --format '{count}'++
+tail = true
+
+Waybar with tooltip and CSS classes:
+
+	"exec": "eupdates watch --json --format '{count}'",++
+"return-type": "json"
 
 # SEE ALSO
 

@@ -1,18 +1,18 @@
 # polybar
 
-polybar wants plain text, so use the `contrib/eupdates-count.sh` helper (until
-eupdates gains native plain output). Copy it somewhere on `PATH`, then:
-
 ```ini
 [module/updates]
 type = custom/script
-exec = eupdates-count.sh
-interval = 3600
-label = %output% 
-click-left = eupdates check
-click-right = eupdates upgrade
-format-prefix = " "
+exec = eupdates watch --format '{count}'
+tail = true
+format-prefix = "pkg "
+click-left = eupdates check --notify &
+click-right = eupdates upgrade &
 ```
 
-Refresh the count on a timer with `eupdates check` (see `../systemd/`); the
-`interval` above just re-reads the cache.
+`tail = true` makes polybar read each line `eupdates watch` prints, so the
+count updates on its own after a sync or an emerge. Nothing else (timer, cron,
+service) is needed.
+
+To show the state too, try `--format '{count} {state}'`, or `{glsa}` for the
+number of unresolved security advisories.

@@ -23,7 +23,10 @@ install: eupdates doc/eupdates.1
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/eupdates $(DESTDIR)$(MANDIR)/man1/eupdates.1
 
+test:
+	CC="$(CC)" sh tests/run.sh
+
 clean:
 	rm -f eupdates doc/eupdates.1
 
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall test clean
