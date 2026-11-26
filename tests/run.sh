@@ -48,8 +48,15 @@ EOF
 printf '#!/bin/sh\necho 202601-01\n' >"$S/glsa-check"
 # gemato records how it was run and passes or fails on demand; the terminal
 # records the command `upgrade` gave it.
-printf '#!/bin/sh\necho "$*" >>"${0%%/*}/gemato.how"\nexit "$(cat "${0%%/*}/gemato.exit")"\n' >"$S/gemato"
-printf '#!/bin/sh\nprintf "%%s\\n" "$@" >"${0%%/*}/term.how"\n' >"$S/term"
+cat >"$S/gemato" <<'EOF'
+#!/bin/sh
+echo "$*" >>"${0%/*}/gemato.how"
+exit "$(cat "${0%/*}/gemato.exit")"
+EOF
+cat >"$S/term" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"${0%/*}/term.how"
+EOF
 echo 0 >"$S/gemato.exit"
 chmod +x "$S/emerge" "$S/glsa-check" "$S/gemato" "$S/term"
 cat >"$S/output" <<'EOF'
