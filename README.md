@@ -1,126 +1,112 @@
 # eupdates
 
-<!-- TODO(josh): one-line tagline in your voice. Working draft: -->
-> Counts pending Gentoo (portage) package updates for any status bar. Zero dependencies, one C file.
+[![ci](https://github.com/joshtreed/eupdates/actions/workflows/ci.yml/badge.svg)](https://github.com/joshtreed/eupdates/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-<!-- TODO(josh): badges once the repo is pushed — CI status, latest release, license (GPL-3.0). -->
+Shows how many Gentoo packages have pending updates, in any status bar.
 
-<!-- TODO(josh): screenshot / asciinema of a bar module. Placeholder: -->
-<!-- ![demo](doc/demo.png) -->
+```
+$ eupdates
+15
+$ eupdates list
+sys-libs/zlib-1.4  (was 1.3.2-r1)
+dev-libs/expat-2.11.0  (was 2.10.0)
+...
+```
 
-## Why
+eupdates runs the same resolve as `emerge -uDN @world`, so the count matches
+what an upgrade would actually merge. That takes a minute or two, so the
+result is cached and refreshed in the background. Reading the count only
+reads the cache, so bars can poll it as often as they like.
 
-<!-- TODO(josh): your prose. Bullet points to draw from: -->
-- Zero runtime dependencies beyond portage itself (which every Gentoo box has).
-- No persistent database to maintain (unlike `eix`, which needs `eix-update`).
-- Uses the **same** resolver as a real update (`emerge -puDN @world`), so the count matches what you'd actually merge.
-- **Never touches a mirror** — it reads the already-synced local tree only. Syncing stays your call.
-- Works with any status bar: plain text, a `--format` template, or JSON; poll it or stream it.
-- No timer, cron job or service to set up: it notices syncs and emerges itself.
-- Single purpose, fast to poll (results are cached; the slow resolve runs in the background).
+- Works with any bar: plain text, a `--format` template, or JSON; poll it or
+  stream it.
+- No timer, cron job or service to set up. It notices syncs, emerges and
+  config changes on its own.
+- Syncs for you. If nobody has synced the tree in two days, it keeps a
+  verified copy of its own, synced at most once a day.
+- One C file, no dependencies beyond portage.
 
 ## Install
 
-From source:
-
 ```sh
 make
-sudo make install          # /usr/local by default; override PREFIX=/usr
+sudo make install    # installs to /usr/local; use PREFIX=/usr to change
 ```
 
-Requirements: a C11 compiler, `scdoc` (man page), and Gentoo/portage at runtime. `glsa-check` (gentoolkit) is optional and enriches the tooltip with security-advisory counts.
-
-<!-- TODO(josh): Gentoo ebuild / GURU overlay instructions once packaged. -->
+Building needs a C11 compiler and `scdoc` for the man page. `glsa-check`
+(from gentoolkit) is optional; with it, eupdates also counts security
+advisories that affect you.
 
 ## Usage
 
 ```
-eupdates                 # print the count from cache and exit (any polling bar)
-eupdates watch           # keep running, print a line whenever it changes (streaming bars)
-eupdates check           # resolve @world now and refresh the cache (slow)
-eupdates list            # pending packages, one per line
-eupdates upgrade         # emerge upgrade in $TERMINAL, then re-check
-eupdates --format '{count} {state}'   # choose the output
-eupdates --json          # one JSON object per line (waybar return-type json)
+eupdates                 print the cached count and exit
+eupdates watch           keep running, print a new line when the count changes
+eupdates check           resolve @world now and refresh the cache
+eupdates list            list pending packages
+eupdates upgrade         run an emerge upgrade in $TERMINAL, then re-check
 ```
 
-### Keeping the count current
+Output is set with `--format`, using the fields `{count}`, `{glsa}`,
+`{synced}` (age of the tree snapshot in days) and `{state}`:
 
-No timer, cron job or init-system service. Every `eupdates` / `eupdates watch`
-call checks with a few dozen `stat` calls whether the cache is out of date, and if so
-starts one detached, low-priority `check` in the background while showing the
-previous count. The cache is out of date when, since the last check:
+```sh
+eupdates --format '{count} updates, synced {synced}d ago'
+```
 
-- any repository was synced (the gentoo tree or an overlay, rsync or git),
-- your portage config changed (`/etc/portage`: `package.use`, keywords, `make.conf`, ...),
-- an emerge finished (portage's `mtimedb` has been quiet for a minute),
+`--json` prints one JSON object per line (`text`, `tooltip`, `class`, `alt`),
+the shape waybar expects. `--notify` sends a desktop notification when the
+count goes up.
+
+See `eupdates(1)` for every option and environment variable.
+
+## Status bars
+
+| Bar | Setup |
+|---|---|
+| waybar | [contrib/waybar](contrib/waybar/) |
+| polybar | [contrib/polybar](contrib/polybar/) |
+| i3blocks | [contrib/i3blocks](contrib/i3blocks/) |
+| tmux | [contrib/tmux](contrib/tmux/) |
+| anything else (conky, dwm, eww, yambar, ...) | [contrib/generic](contrib/generic/) |
+
+Bars that run a command on an interval use `eupdates`. Bars that read a
+long-running command use `eupdates watch`.
+
+## When it checks
+
+Each time a bar asks for the count, eupdates checks whether the cache is out
+of date. If it is, eupdates starts one low-priority check in the background and
+shows the old count until the check finishes. The cache is out of date when,
+since the last check:
+
+- a repository was synced (the gentoo tree or an overlay, rsync or git),
+- something under `/etc/portage` changed,
+- an emerge finished,
 - the world file changed, or
-- `EUPDATES_MAX_AGE` hours went by (default 24).
+- 24 hours went by (`EUPDATES_MAX_AGE`).
 
-No check starts while `emerge` or `emaint` is running. Only one check runs at a
-time, however many bars ask. A failed check (for example an unresolved blocker)
-keeps the previous count and is not retried until something changes.
+If no one has synced a repository in two days, the check first syncs
+eupdates' own copy of it (in `~/.cache/eupdates/repos`), at most once a day and
+verified the way `emerge --sync` verifies it. The count then comes from that
+copy, and `eupdates upgrade` runs `emerge --sync` before upgrading. The first
+copy of the gentoo tree takes as much disk as the system one (about 600 MB).
+Use `--no-sync` (or `EUPDATES_SYNC=0`) if you sync yourself and don't want the
+copy.
 
-Want to decide when checks run? Pass `--no-auto` or set `EUPDATES_AUTO=0`, and
-run `eupdates check` from cron, a timer or by hand.
+It waits while `emerge` or `emaint` is running, and runs only one check at a
+time. If a check fails (an unresolved blocker, say), the last good count stays
+and it doesn't retry until something changes.
 
-### How it works
-
-`check` runs `emerge --pretend --update --deep --newuse @world` against the
-local synced tree, counts the pending merges, and caches the list under
-`$XDG_CACHE_HOME/eupdates`. emerge is run directly, not through a shell, with
-your own settings (`EMERGE_DEFAULT_OPTS` such as `--with-bdeps=y` change what a
-real upgrade merges, so they count); only its output is pinned (no colour, C
-locale), and its input is closed so an `--ask` default can never hang it. Display commands only read that cache. Nothing here
-contacts the network: only `emerge --sync` does, and eupdates never calls it.
-
-## Status-bar integration
-
-| Bar | How | Guide |
-|---|---|---|
-| waybar | `exec: eupdates watch --json`, no interval | `contrib/waybar/` |
-| polybar | `exec = eupdates watch`, `tail = true` | `contrib/polybar/` |
-| i3blocks | `interval=persist` with `watch`, or poll | `contrib/i3blocks/` |
-| tmux | `#(eupdates)` | `contrib/tmux/` |
-| conky, dwm, eww, yambar, cron, … | poll `eupdates` or stream `eupdates watch` | `contrib/generic/` |
-
-## Options
-
-| Command / flag | Effect |
-|---|---|
-| `status` | Print one line from the cache and exit (default). |
-| `watch` | Keep running; print a line whenever the output changes. Exits when the bar closes the pipe. |
-| `check` | Resolve `@world` now and refresh the cache. Non-zero exit if emerge failed. |
-| `list` | Print the cached pending packages, one per line. |
-| `upgrade` | Interactive `emerge` upgrade in `$TERMINAL`, then `check`. |
-| `--format TPL` | Output template. Fields `{count}`, `{glsa}`, `{synced}` (days since sync), `{state}`. Default `{count}`. |
-| `--json` | One JSON object per line: `text`, `tooltip`, `class`, `alt`. |
-| `--no-auto` | Never start a check on its own. |
-| `--notify` | Desktop notification (`notify-send`) when the count changes. A background check reports only a count that rose; `check` reports every outcome. |
-| `--no-notify` | Suppress notifications (overrides `EUPDATES_NOTIFY`). |
-| `-h`, `--help` / `-V`, `--version` | Usage / version. |
-
-| Environment | Effect |
-|---|---|
-| `EUPDATES_AUTO` | `0` = `--no-auto`. |
-| `EUPDATES_MAX_AGE` | Check at least every this many hours (default `24`). |
-| `EUPDATES_NOTIFY` | Notify on change when set to non-empty and not `0`. |
-| `EUPDATES_ICON` | Notification icon: XDG icon name (default `system-software-update`) or absolute image path. |
-| `TERMINAL` | Terminal for `upgrade` (default `xterm`). |
-| `XDG_CACHE_HOME` | Cache dir (default `~/.cache/eupdates`). |
-
-`{state}`, `class` and `alt` are `pending`, `updated`, `checking` (a manual
-check is running) or `unknown` (no check finished yet). `notify-send` is
-optional; without it notifications are skipped.
-
-## Roadmap
-
-See `CHANGELOG.md`.
+To schedule checks yourself, use `--no-auto` (or `EUPDATES_AUTO=0`) and run
+`eupdates check` from cron or a timer.
 
 ## Contributing
 
-See `CONTRIBUTING.md`.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-GPL-3.0-or-later. Copyright © Josh Reed.
+GPL-3.0-or-later. See [LICENSE](LICENSE).
