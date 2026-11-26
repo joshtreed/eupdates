@@ -47,11 +47,12 @@ eupdates --json          # one JSON object per line (waybar return-type json)
 ### Keeping the count current
 
 No timer, cron job or init-system service. Every `eupdates` / `eupdates watch`
-call checks with a few `stat` calls whether the cache is out of date, and if so
+call checks with a few dozen `stat` calls whether the cache is out of date, and if so
 starts one detached, low-priority `check` in the background while showing the
 previous count. The cache is out of date when, since the last check:
 
-- the portage tree was synced,
+- any repository was synced (the gentoo tree or an overlay, rsync or git),
+- your portage config changed (`/etc/portage`: `package.use`, keywords, `make.conf`, ...),
 - an emerge finished (portage's `mtimedb` has been quiet for a minute),
 - the world file changed, or
 - `EUPDATES_MAX_AGE` hours went by (default 24).
@@ -67,7 +68,10 @@ run `eupdates check` from cron, a timer or by hand.
 
 `check` runs `emerge --pretend --update --deep --newuse @world` against the
 local synced tree, counts the pending merges, and caches the list under
-`$XDG_CACHE_HOME/eupdates`. Display commands only read that cache. Nothing here
+`$XDG_CACHE_HOME/eupdates`. emerge is run directly, not through a shell, with
+your own settings (`EMERGE_DEFAULT_OPTS` such as `--with-bdeps=y` change what a
+real upgrade merges, so they count); only its output is pinned (no colour, C
+locale), and its input is closed so an `--ask` default can never hang it. Display commands only read that cache. Nothing here
 contacts the network: only `emerge --sync` does, and eupdates never calls it.
 
 ## Status-bar integration

@@ -20,6 +20,12 @@ matches what a real *emerge -uDN @world* would merge. It never contacts a
 mirror: the only mirror-hitting operation on Gentoo is *emerge --sync*, which
 *eupdates* deliberately does not perform.
 
+*emerge* is run directly, without a shell, and with the user's own portage
+settings: *EMERGE_DEFAULT_OPTS* such as *--with-bdeps=y* change what a real
+upgrade merges, so they count. Only the output is pinned (*NOCOLOR*, *LC_ALL=C*,
+*--color=n*), and standard input is _/dev/null_, so an *--ask* default can never
+wait for an answer.
+
 That resolve takes as long as a real *emerge --pretend* (often a minute or two of
 CPU), so its result is cached under _$XDG_CACHE_HOME/eupdates_ and every display
 command only reads the cache.
@@ -32,7 +38,10 @@ date, and if so starts one detached, low-priority *check* in the background
 while showing the previous count. The cache is out of date when, since the last
 check:
 
-- the portage tree was synced;
+- any repository was synced: the gentoo tree or an overlay, by rsync or git
+  (every _location_ in _repos.conf_);
+- the portage configuration under _/etc/portage_ changed (_package.use_,
+  _package.accept_keywords_, _make.conf_, the profile link, ...);
 - an emerge finished (portage's _/var/cache/edb/mtimedb_ has been quiet for a
   minute);
 - the world file changed; or
@@ -82,7 +91,7 @@ the user whose bar shows the count (the cache is per user).
 
 	*{count}*   pending updates (*?* before the first check)++
 *{glsa}*    unresolved security advisories (needs *glsa-check*)++
-*{synced}*  days since the portage tree was synced++
+*{synced}*  age of the gentoo tree's snapshot, in days++
 *{state}*   *pending*, *updated*, *checking* or *unknown*
 
 	Anything else is printed as is. Default: *{count}*.

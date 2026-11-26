@@ -9,31 +9,42 @@ T=$(mktemp -d)
 trap 'kill $WATCH 2>/dev/null || true; rm -rf "$T"' EXIT INT TERM
 WATCH=
 
-# Fake portage: a tree timestamp, a world file, an mtimedb, and an "emerge"
-# that sleeps briefly, prints canned merge lines and exits with a chosen code.
-mkdir -p "$T/cache" "$T/sys" "$T/proc"
-touch "$T/sys/timestamp.chk" "$T/sys/world" "$T/sys/mtimedb"
-cat >"$T/sys/emerge" <<'EOF'
+# Fake portage in a directory with a space in its name (no shell may touch
+# these paths): a gentoo tree synced by rsync, an overlay synced by git, a
+# user config dir, a world file, an mtimedb, and an "emerge" that records how
+# it was run, sleeps briefly, prints canned merge lines and exits with a
+# chosen code.
+S="$T/sys dir"
+mkdir -p "$T/cache" "$T/proc" "$S/repos/gentoo/metadata" "$S/repos/ov/.git" \
+    "$S/portage/repos.conf" "$S/portage/package.use" "$S/portage/gnupg"
+touch "$S/repos/gentoo/metadata/timestamp.chk" "$S/repos/ov/.git/FETCH_HEAD" "$S/world" \
+    "$S/mtimedb" "$S/portage/package.use/local" "$S/portage/gnupg/pubring.kbx"
+printf '[DEFAULT]\nmain-repo = gentoo\n\n[gentoo]\nlocation = %s/repos/gentoo\n' "$S" >"$S/repos.default"
+printf '[ov]\n  location=%s/repos/ov  \n' "$S" >"$S/portage/repos.conf/ov.conf"
+cat >"$S/emerge" <<'EOF'
 #!/bin/sh
 d=$(dirname "$0")
 echo run >>"$d/runs"
+printf '%s|%s|%s|%s\n' "$*" "${NOCOLOR-}" "${LC_ALL-}" "${EMERGE_DEFAULT_OPTS-}" >"$d/how"
+read -r leaked && echo "stdin:$leaked" >>"$d/how"
 sleep "${FAKE_SLEEP:-1}"
 cat "$d/output"
 exit "$(cat "$d/exit")"
 EOF
-chmod +x "$T/sys/emerge"
-cat >"$T/sys/output" <<'EOF'
+printf '#!/bin/sh\necho 202601-01\n' >"$S/glsa-check"
+chmod +x "$S/emerge" "$S/glsa-check"
+cat >"$S/output" <<'EOF'
 These are the packages that would be merged, in order:
 [ebuild     U  ] sys-libs/zlib-1.4::gentoo [1.3.2-r1::gentoo] USE="-minizip" 0 KiB
 [binary   R    ] dev-libs/expat-2.11.0::gentoo  USE="unicode" 0 KiB
 [ebuild  N     ] app-misc/new-1.0::gentoo  0 KiB
 EOF
-echo 0 >"$T/sys/exit"
+echo 0 >"$S/exit"
 
-S=$T/sys
 $CC -O2 -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L \
-    -DEUPDATES_EMERGE_CMD="\"$S/emerge\"" -DEUPDATES_GLSA_CMD="\"echo 202601-01\"" \
-    -DEUPDATES_TREE_TS="\"$S/timestamp.chk\"" -DEUPDATES_WORLD="\"$S/world\"" \
+    -DEUPDATES_EMERGE="\"$S/emerge\"" -DEUPDATES_GLSA="\"$S/glsa-check\"" \
+    -DEUPDATES_PORTAGE_DIR="\"$S/portage\"" -DEUPDATES_REPOS_DEFAULT="\"$S/repos.default\"" \
+    -DEUPDATES_WORLD="\"$S/world\"" \
     -DEUPDATES_MTIMEDB="\"$S/mtimedb\"" -DEUPDATES_PROC="\"$T/proc\"" -o "$T/eupdates" src/eupdates.c
 
 export XDG_CACHE_HOME="$T/cache" EUPDATES_NOTIFY=0
@@ -72,55 +83,76 @@ expect "count after first check" 3 "$("$E")"
 sleep 0.3
 expect "no check when nothing changed" 1 "$(runs)"
 
-# 3. A sync (tree timestamp newer than the last attempt) -> one check.
+# 3. A sync -> one check. rsync stamps timestamp.chk with the mirror's (older)
+# time, so the sync must be seen by its change time, not its mtime.
 sleep 1.1
-touch "$S/timestamp.chk"
+touch -d "@$(($(date +%s) - 3 * 86400 - 60))" "$S/repos/gentoo/metadata/timestamp.chk"
 "$E" >/dev/null
 wait_idle
-expect "sync triggers a check" 2 "$(runs)"
+expect "gentoo sync (old mirror mtime) triggers a check" 2 "$(runs)"
+expect "{synced} is the snapshot age" 3 "$("$E" --no-auto --format '{synced}')"
+
+# 3b. An overlay synced by git (no timestamp.chk, only FETCH_HEAD) -> one check.
+sleep 1.1
+touch "$S/repos/ov/.git/FETCH_HEAD"
+"$E" >/dev/null
+wait_idle
+expect "overlay sync triggers a check" 3 "$(runs)"
 
 # 4. World file edited -> one check.
 sleep 1.1
 touch "$S/world"
 "$E" >/dev/null
 wait_idle
-expect "world change triggers a check" 3 "$(runs)"
+expect "world change triggers a check" 4 "$(runs)"
+
+# 4b. Portage config edited (package.use) -> one check; gnupg/ churn -> none.
+sleep 1.1
+echo "app-misc/new foo" >>"$S/portage/package.use/local"
+"$E" >/dev/null
+wait_idle
+expect "config change triggers a check" 5 "$(runs)"
+sleep 1.1
+touch "$S/portage/gnupg/pubring.kbx"
+"$E" >/dev/null
+sleep 0.3
+expect "gnupg change ignored" 5 "$(runs)"
 
 # 5. An emerge just wrote mtimedb -> wait for it to go quiet, then check.
 sleep 1.1
 touch "$S/mtimedb"
 "$E" >/dev/null
 sleep 0.3
-expect "fresh merge: no check yet" 3 "$(runs)"
+expect "fresh merge: no check yet" 5 "$(runs)"
 age "$T/cache/eupdates/attempt" 300
 age "$S/mtimedb" 120
 "$E" >/dev/null
 wait_idle
-expect "quiet merge triggers a check" 4 "$(runs)"
+expect "quiet merge triggers a check" 6 "$(runs)"
 
 # 6. Max age: an attempt older than EUPDATES_MAX_AGE hours -> check.
 age "$T/cache/eupdates/attempt" 7200
 EUPDATES_MAX_AGE=1 "$E" >/dev/null
 wait_idle
-expect "max age triggers a check" 5 "$(runs)"
+expect "max age triggers a check" 7 "$(runs)"
 
 # 7. --no-auto / EUPDATES_AUTO=0 never start a check.
 age "$T/cache/eupdates/attempt" 999999
 "$E" --no-auto >/dev/null
 EUPDATES_AUTO=0 "$E" >/dev/null
 sleep 0.3
-expect "--no-auto starts nothing" 5 "$(runs)"
+expect "--no-auto starts nothing" 7 "$(runs)"
 
 # 7b. Portage busy (an emerge or sync running) -> hold off, check once it ends.
 mkdir -p "$T/proc/4242"
 echo emerge >"$T/proc/4242/comm"
 "$E" >/dev/null
 sleep 0.3
-expect "no check while emerge runs" 5 "$(runs)"
+expect "no check while emerge runs" 7 "$(runs)"
 rm -r "$T/proc/4242"
 "$E" >/dev/null
 wait_idle
-expect "check once emerge is gone" 6 "$(runs)"
+expect "check once emerge is gone" 8 "$(runs)"
 
 # 8. Failing emerge: cache kept, and no retry storm afterwards.
 echo 1 >"$S/exit"
@@ -142,6 +174,14 @@ r=$(runs)
 wait "$bg"
 expect "concurrent check skipped" "$r" "$(runs)"
 if grep -q "already running" "$T/err"; then ok "concurrent check says so"; else bad "concurrent check message"; fi
+
+# 9b. How emerge was run: argv without a shell, output pinned, the user's
+# EMERGE_DEFAULT_OPTS kept (it decides what a real upgrade merges), stdin
+# closed so an --ask there can never wait for input.
+echo "stray input" | EMERGE_DEFAULT_OPTS=--with-bdeps=y "$E" check >/dev/null 2>&1
+expect "emerge argv, env and stdin" \
+    "--pretend --update --deep --newuse --color=n --nospinner @world|true|C|--with-bdeps=y" \
+    "$(cat "$S/how")"
 
 # 10. Output formats.
 expect "--format fields" "3 pending, 1 glsa" "$("$E" --no-auto --format '{count} {state}, {glsa} glsa')"
