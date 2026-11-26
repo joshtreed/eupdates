@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -532,7 +533,13 @@ static time_t manifest_time(const char *tree) {
 
 /* gemato's -K key and -R (no key refresh) options for a repository. Fails
  * closed: a repository that asks for verification but names no key is not
- * synced. Returns the number of argv slots filled, or -1. */
+ * synced. Returns the number of argv slots filled, or -1.
+ *
+ * The refresh gets a short connect timeout. gemato's own is 180 s per address
+ * and it tries each address in turn, so on a network that drops some of a
+ * host's IPv6 addresses (common behind VPNs) one refresh took 16 minutes. A
+ * refresh that still fails makes verification fail, so this only fails
+ * sooner, never more open. */
 static int key_args(const struct conf *c, const char *sec, char **argv) {
     const char *key = conf_get(c, sec, "sync-openpgp-key-path");
     if (!key || !*key) {
@@ -543,7 +550,14 @@ static int key_args(const struct conf *c, const char *sec, char **argv) {
     int n = 0;
     argv[n++] = "-K";
     argv[n++] = (char *)key;
-    if (!conf_bool(c, sec, "sync-openpgp-key-refresh", 1)) argv[n++] = "-R";
+    const char *refresh = conf_get(c, sec, "sync-openpgp-key-refresh");
+    if (!conf_bool(c, sec, "sync-openpgp-key-refresh", 1) ||
+        (refresh && strcasecmp(refresh, "false-nowarn") == 0)) {
+        argv[n++] = "-R";
+    } else {
+        argv[n++] = "--timeout";
+        argv[n++] = "10";
+    }
     return n;
 }
 

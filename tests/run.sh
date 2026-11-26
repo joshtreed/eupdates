@@ -271,7 +271,7 @@ sleep 2.1
 # 14a. Stale system tree -> our copies are synced, verified and used.
 "$E" check >/dev/null 2>"$T/err" || true
 expect "rsync copy synced" v1 "$(cat "$C/repos/gentoo/pkg" 2>/dev/null)"
-expect "gemato verified the new snapshot" "verify -q -s -K $S/key.asc $C/repos/gentoo.new" \
+expect "gemato verified the new snapshot" "verify -q -s -K $S/key.asc --timeout 10 $C/repos/gentoo.new" \
     "$(cat "$S/gemato.how" 2>/dev/null)"
 expect "git copy synced" two "$(cat "$C/repos/gitov/file" 2>/dev/null)"
 expect "emerge pointed at our config root" "$C/root" "$(cat "$S/root")"
@@ -344,6 +344,19 @@ echo 0 >"$S/gemato.exit"
 age "$C/repos/.gitov.tried" 86400
 "$E" check >/dev/null 2>&1 || true
 expect "signed git commit checked out" four "$(cat "$C/repos/gitov/file")"
+case "$(tail -n 1 "$S/gemato.how")" in
+"gpg-wrap -K $S/key.asc --timeout 10 -- "*) ok "key refresh gets a short timeout" ;;
+*) bad "no refresh timeout: $(tail -n 1 "$S/gemato.how")" ;;
+esac
+echo 'sync-openpgp-key-refresh = false-nowarn' >>"$S/portage/repos.conf/gitov.conf"
+echo five >"$S/upstream/gitov/file"
+G -C "$S/upstream/gitov" commit -qam five
+age "$C/repos/.gitov.synced" 86400
+"$E" check >/dev/null 2>&1 || true
+case "$(tail -n 1 "$S/gemato.how")" in
+"gpg-wrap -K $S/key.asc -R -- "*) ok "false-nowarn turns key refresh off" ;;
+*) bad "false-nowarn ignored: $(tail -n 1 "$S/gemato.how")" ;;
+esac
 
 # 14g. A swap cut short (copy moved aside, never moved back) heals.
 mirror v3 20
