@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
 ### Added
 - Works with any status bar, not just waybar.
   - `watch`: keeps running and prints a line whenever the output changes, for
@@ -82,3 +84,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `--help` / `--version`; `TERMINAL` and `EUPDATES_WAYBAR_SIGNAL` env knobs.
 - Man page (`scdoc`), Makefile with `DESTDIR`/`PREFIX` support, example
   status-bar and systemd integration snippets.
+
+[Unreleased]: https://github.com/joshtreed/eupdates/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/joshtreed/eupdates/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/joshtreed/eupdates/releases/tag/v0.1.0
