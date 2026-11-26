@@ -20,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   synced, an emerge finished (`mtimedb` quiet for a minute), the world file
   changed, or `EUPDATES_MAX_AGE` hours (default 24) went by. Never while
   `emerge` or `emaint` runs.
+- Notices syncs of every repository in `repos.conf` (overlays too, rsync or
+  git), and edits under `/etc/portage` (`package.use`, keywords, `make.conf`,
+  profile). A sync is seen by its change time: rsync gives `timestamp.chk` the
+  mirror's (older) mtime, which could hide a sync from 0.1.0.
 - `--no-auto` / `EUPDATES_AUTO=0` for people who schedule `check` themselves.
 - A lock, so only one check runs at a time however many bars and clicks ask.
 - A failed check counts as an attempt, so a broken tree is not retried in a
@@ -30,6 +34,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - **Breaking:** the default output is now plain text (`{count}`), not waybar
   JSON. waybar users add `--json`; see `contrib/waybar/`.
+- emerge and glsa-check run directly (fork/exec, no `/bin/sh`), with stdin
+  on `/dev/null` so an `--ask` in `EMERGE_DEFAULT_OPTS` can never hang a
+  check, and output pinned with `NOCOLOR=true` and `LC_ALL=C`. The user's
+  `EMERGE_DEFAULT_OPTS` is kept on purpose: options like `--with-bdeps=y`
+  change what a real upgrade merges.
+- Build-time overrides renamed: `EUPDATES_EMERGE` / `EUPDATES_GLSA` (program
+  paths) replace `EUPDATES_EMERGE_CMD` / `EUPDATES_GLSA_CMD` (shell strings);
+  `EUPDATES_PORTAGE_DIR` and `EUPDATES_REPOS_DEFAULT` replace
+  `EUPDATES_TREE_TS`. The old names are a compile error.
 - A background check notifies only when the pending count *rises*, or on the
   first count seen. A count that fell is the result of an emerge you just ran.
   `check` still reports every outcome.
@@ -40,12 +53,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it), and the systemd units and `eupdates-count.sh` helper in `contrib/`.
 
 ### Planned (hardening toward 1.0.0)
-- Replace `popen`/`/bin/sh` with `execve` and an explicitly scrubbed
-  environment (`LC_ALL=C`, `COLUMNS=1000`, `EMERGE_DEFAULT_OPTS=`, `NOCOLOR`)
-  so a user's emerge defaults or locale can't reshape the parsed output.
 - Parse `emerge --columns` output (portage's most stable per-line format).
-- Notice syncs of every configured repo, not just the main tree, and changes
-  under `/etc/portage`.
 - Optional `eix` fast backend (auto-detected, labelled approximate).
 
 ## [0.1.0] - 2026-07-23

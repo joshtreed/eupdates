@@ -46,15 +46,20 @@
 
 /* Every system path is overridable at build time so the tests can run without
  * root and without a real two-minute resolve. */
-#ifndef EUPDATES_EMERGE_CMD /* offline: resolves the local tree only */
-#define EUPDATES_EMERGE_CMD                                                                \
-    "emerge --pretend --update --deep --newuse --color=n --nospinner @world 2>/dev/null"
+#if defined(EUPDATES_EMERGE_CMD) || defined(EUPDATES_GLSA_CMD) || defined(EUPDATES_TREE_TS)
+#error "0.2: use EUPDATES_EMERGE / EUPDATES_GLSA (programs) and EUPDATES_PORTAGE_DIR"
 #endif
-#ifndef EUPDATES_GLSA_CMD /* offline: reads GLSA metadata shipped with the tree */
-#define EUPDATES_GLSA_CMD "glsa-check --test affected 2>/dev/null"
+#ifndef EUPDATES_EMERGE /* offline: resolves the local tree only */
+#define EUPDATES_EMERGE "emerge"
 #endif
-#ifndef EUPDATES_TREE_TS /* rewritten by every sync */
-#define EUPDATES_TREE_TS "/var/db/repos/gentoo/metadata/timestamp.chk"
+#ifndef EUPDATES_GLSA /* offline: reads GLSA metadata shipped with the tree */
+#define EUPDATES_GLSA "glsa-check"
+#endif
+#ifndef EUPDATES_PORTAGE_DIR /* user config: package.*, make.conf, repos.conf */
+#define EUPDATES_PORTAGE_DIR "/etc/portage"
+#endif
+#ifndef EUPDATES_REPOS_DEFAULT /* portage's own repos.conf ([gentoo] location) */
+#define EUPDATES_REPOS_DEFAULT "/usr/share/portage/config/repos.conf"
 #endif
 #ifndef EUPDATES_MTIMEDB /* rewritten by portage once per merge/unmerge */
 #define EUPDATES_MTIMEDB "/var/cache/edb/mtimedb"
@@ -133,8 +138,130 @@ static int read_int_file(const char *path) {
     return v;
 }
 
+/* ctime of a path, or 0. A sync sets the files it copies to the mirror's
+ * mtime, so only the change time says when this machine last synced. */
+static time_t ctime_of(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_ctime : 0;
+}
+
+/* ---- repositories and config --------------------------------------------- */
+
+struct repos {
+    time_t synced;     /* newest sync of any repository (ctime), 0 unknown */
+    char gentoo[4096]; /* location of the [gentoo] repository, "" unknown */
+};
+
+static void trim(char **s) {
+    while (isspace((unsigned char)**s))
+        (*s)++;
+    char *e = *s + strlen(*s);
+    while (e > *s && isspace((unsigned char)e[-1]))
+        *--e = '\0';
+}
+
+/* A sync leaves its mark on metadata/timestamp.chk (rsync, and git mirrors of
+ * the gentoo tree) or .git/FETCH_HEAD (every git fetch, overlays included). */
+static time_t repo_synced(const char *loc) {
+    char p[4096 + 32];
+    snprintf(p, sizeof p, "%s/metadata/timestamp.chk", loc);
+    time_t a = ctime_of(p);
+    snprintf(p, sizeof p, "%s/.git/FETCH_HEAD", loc);
+    time_t b = ctime_of(p);
+    return a > b ? a : b;
+}
+
+static void scan_repos_file(const char *path, struct repos *r) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char *line = NULL, section[256] = "";
+    size_t cap = 0;
+    while (getline(&line, &cap, fp) != -1) {
+        char *s = line;
+        trim(&s);
+        if (*s == '[') {
+            char *e = strchr(s, ']');
+            if (e) snprintf(section, sizeof section, "%.*s", (int)(e - s - 1), s + 1);
+            continue;
+        }
+        if (strncmp(s, "location", 8) != 0) continue;
+        char *v = s + 8;
+        trim(&v);
+        if (*v != '=') continue;
+        v++;
+        trim(&v);
+        if (!*v) continue;
+        time_t t = repo_synced(v);
+        if (t > r->synced) r->synced = t;
+        if (strcmp(section, "gentoo") == 0) snprintf(r->gentoo, sizeof r->gentoo, "%s", v);
+    }
+    free(line);
+    fclose(fp);
+}
+
+/* Like portage: repos.conf is a file or a directory of files; hidden and
+ * backup~ files are skipped. */
+static void scan_repos_conf(const char *path, struct repos *r) {
+    DIR *d = opendir(path);
+    if (!d) {
+        scan_repos_file(path, r);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == '.' || e->d_name[n - 1] == '~') continue;
+        char p[4096 + 256];
+        snprintf(p, sizeof p, "%s/%s", path, e->d_name);
+        scan_repos_file(p, r);
+    }
+    closedir(d);
+}
+
+/* Every configured repository, overlays included: portage's defaults first,
+ * then the user's repos.conf, which may move [gentoo]. */
+static void find_repos(struct repos *r) {
+    r->synced = 0;
+    r->gentoo[0] = '\0';
+    scan_repos_conf(EUPDATES_REPOS_DEFAULT, r);
+    scan_repos_conf(EUPDATES_PORTAGE_DIR "/repos.conf", r);
+}
+
+/* Newest change under the user's portage config (package.use, accept_keywords,
+ * make.conf, a new profile link...), `depth` directory levels down. Symlinks
+ * are not followed, so the profile tree itself is not walked; gnupg/ holds
+ * binary-package trust keys, not update policy. */
+static time_t config_changed(const char *path, int depth) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+    time_t t = st.st_ctime;
+    if (depth <= 0 || !S_ISDIR(st.st_mode)) return t;
+    DIR *d = opendir(path);
+    if (!d) return t;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == '.' || e->d_name[n - 1] == '~' ||
+            strcmp(e->d_name, "gnupg") == 0)
+            continue;
+        char p[4096 + 256];
+        snprintf(p, sizeof p, "%s/%s", path, e->d_name);
+        time_t c = config_changed(p, depth - 1);
+        if (c > t) t = c;
+    }
+    closedir(d);
+    return t;
+}
+
+/* Age of the gentoo tree's snapshot (its timestamp.chk mtime is the mirror's
+ * time), in days, or -1 unknown. */
 static int tree_age_days(void) {
-    time_t t = mtime_of(EUPDATES_TREE_TS);
+    struct repos r;
+    find_repos(&r);
+    if (!r.gentoo[0]) return -1;
+    char p[4096 + 32];
+    snprintf(p, sizeof p, "%s/metadata/timestamp.chk", r.gentoo);
+    time_t t = mtime_of(p);
     if (!t) return -1;
     double d = difftime(time(NULL), t) / 86400.0;
     return d < 0 ? 0 : (int)d;
@@ -228,8 +355,59 @@ static int format_pkg(const char *line, FILE *out) {
     return 1;
 }
 
+/* Run argv (PATH lookup, no shell) with its stdout piped back. stdin and
+ * stderr are /dev/null, so an --ask in EMERGE_DEFAULT_OPTS can never wait on
+ * input. The user's portage settings (EMERGE_DEFAULT_OPTS included) are kept on
+ * purpose: they decide what a real upgrade would merge. Only the output is
+ * pinned: no colour, C locale. */
+static FILE *run_reader(char *const argv[], pid_t *pid) {
+    int p[2];
+    if (pipe(p) != 0) return NULL;
+    fflush(NULL);
+    pid_t c = fork();
+    if (c < 0) {
+        close(p[0]);
+        close(p[1]);
+        return NULL;
+    }
+    if (c == 0) {
+        int nul = open("/dev/null", O_RDWR);
+        if (nul < 0) _exit(127);
+        dup2(nul, 0);
+        dup2(p[1], 1);
+        dup2(nul, 2);
+        close(p[0]);
+        close(p[1]);
+        if (nul > 2) close(nul);
+        setenv("NOCOLOR", "true", 1);
+        setenv("LC_ALL", "C", 1);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(p[1]);
+    FILE *fp = fdopen(p[0], "r");
+    if (!fp) {
+        close(p[0]);
+        waitpid(c, NULL, 0);
+        return NULL;
+    }
+    *pid = c;
+    return fp;
+}
+
+/* Close a run_reader() stream; the child's exit code, or -1 if it died. */
+static int finish_reader(FILE *fp, pid_t pid) {
+    fclose(fp);
+    int st;
+    while (waitpid(pid, &st, 0) < 0)
+        if (errno != EINTR) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
 static int count_glsa(void) {
-    FILE *fp = popen(EUPDATES_GLSA_CMD, "r");
+    char *argv[] = {EUPDATES_GLSA, "--test", "affected", NULL};
+    pid_t pid;
+    FILE *fp = run_reader(argv, &pid);
     if (!fp) return 0;
     int n = 0;
     char *line = NULL;
@@ -237,7 +415,7 @@ static int count_glsa(void) {
     while (getline(&line, &cap, fp) != -1)
         if (isdigit((unsigned char)line[0])) n++; /* affected GLSA ids */
     free(line);
-    pclose(fp);
+    finish_reader(fp, pid);
     return n;
 }
 
@@ -247,7 +425,7 @@ static int count_glsa(void) {
 static int take_lock(void) {
     char path[4096];
     cache_path(path, sizeof path, "lock");
-    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return -1;
     struct flock fl = {0};
     fl.l_type = F_WRLCK;
@@ -291,7 +469,10 @@ static int run_check(int manual, int notify) {
 
     int rc = 1, n = 0;
     FILE *out = fopen(tmp, "w");
-    FILE *fp = out ? popen(EUPDATES_EMERGE_CMD, "r") : NULL;
+    char *argv[] = {EUPDATES_EMERGE, "--pretend",   "--update", "--deep", "--newuse",
+                    "--color=n",     "--nospinner", "@world",   NULL};
+    pid_t pid = 0;
+    FILE *fp = out ? run_reader(argv, &pid) : NULL;
     if (!out) {
         fprintf(stderr, "eupdates: %s: %s\n", tmp, strerror(errno));
     } else if (!fp) {
@@ -304,11 +485,11 @@ static int run_check(int manual, int notify) {
             if (strncmp(line, "[ebuild", 7) == 0 || strncmp(line, "[binary", 7) == 0)
                 n += format_pkg(line, out);
         free(line);
-        int st = pclose(fp);
+        int st = finish_reader(fp, pid);
         fclose(out);
-        /* emerge failed (blockers, broken tree): keep the old cache rather
-         * than report zero. */
-        if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        /* emerge failed (blockers, broken tree, not installed): keep the old
+         * cache rather than report zero. */
+        if (st != 0)
             fputs("eupdates: emerge exited abnormally; keeping cache\n", stderr);
         else if (rename(tmp, list) != 0)
             fprintf(stderr, "eupdates: rename: %s\n", strerror(errno));
@@ -365,18 +546,23 @@ static int max_age_secs(void) {
 }
 
 /* Does the cache need a fresh resolve? Yes when there has never been an attempt,
- * or since the last attempt the tree was synced, the world file changed, an
- * emerge finished, or a day went by. Never while portage is mid-merge/sync:
- * the answer would be stale before it landed. Only stat()s, so cheap enough
- * for every poll and every watch tick. */
+ * or since the last attempt any repository was synced, the world file or the
+ * portage config changed, an emerge finished, or a day went by. Never while
+ * portage is mid-merge/sync: the answer would be stale before it landed.
+ * Two small repos.conf reads and a stat per config file (about 60 on a typical
+ * system): cheap enough for every poll and every watch tick. */
 static int out_of_date(void) {
     char stamp[4096];
     cache_path(stamp, sizeof stamp, "attempt");
     time_t last = mtime_of(stamp), now = time(NULL);
     time_t merged = mtime_of(EUPDATES_MTIMEDB);
 
-    int due = last == 0 || mtime_of(EUPDATES_TREE_TS) > last ||
-              mtime_of(EUPDATES_WORLD) > last || now - last >= max_age_secs() ||
+    struct repos r;
+    find_repos(&r);
+
+    int due = last == 0 || r.synced > last || mtime_of(EUPDATES_WORLD) > last ||
+              config_changed(EUPDATES_PORTAGE_DIR, 2) > last ||
+              now - last >= max_age_secs() ||
               (merged > last && now - merged >= MERGE_QUIET);
     return due && !portage_busy();
 }
