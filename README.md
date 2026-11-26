@@ -5,6 +5,8 @@
 
 Shows how many Gentoo packages have pending updates, in any status bar.
 
+![eupdates in waybar, with its tooltip open](doc/screenshot.png)
+
 ```
 $ eupdates
 15
