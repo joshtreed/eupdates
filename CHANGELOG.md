@@ -24,6 +24,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   git), and edits under `/etc/portage` (`package.use`, keywords, `make.conf`,
   profile). A sync is seen by its change time: rsync gives `timestamp.chk` the
   mirror's (older) mtime, which could hide a sync from 0.1.0.
+- Syncs on its own, so the count moves even if nobody runs `emerge --sync`. A
+  user cannot sync the system tree, so when a repository's system copy is more
+  than two days old, eupdates keeps its own copy under
+  `$XDG_CACHE_HOME/eupdates/repos` and syncs that, at most once a day per
+  repository (an hour apart after a failure). rsync repositories are verified
+  as portage verifies them (`gemato`, signed Manifest, `max-age`, no
+  rollback); git repositories check the commit signature when `repos.conf`
+  asks. Anything that fails verification is thrown away and the old copy
+  kept. Only this user's `emerge --pretend` reads the copies, through a
+  private `PORTAGE_CONFIGROOT`; `upgrade` runs `emerge --sync` first when the
+  count came from one. `--no-sync` / `EUPDATES_SYNC=0` turn it off.
 - `--no-auto` / `EUPDATES_AUTO=0` for people who schedule `check` themselves.
 - A lock, so only one check runs at a time however many bars and clicks ask.
 - A failed check counts as an attempt, so a broken tree is not retried in a
