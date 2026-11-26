@@ -73,6 +73,8 @@ $CC -O2 -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L \
     -DEUPDATES_WORLD="\"$S/world\"" -DEUPDATES_GEMATO="\"$S/gemato\"" -DEUPDATES_SYSTEM_FRESH=2 \
     -DEUPDATES_MTIMEDB="\"$S/mtimedb\"" -DEUPDATES_PROC="\"$T/proc\"" -o "$T/eupdates" src/eupdates.c
 
+# Run the same whoever calls us: an ebuild's environment sets PORTAGE_CONFIGROOT.
+unset PORTAGE_CONFIGROOT EUPDATES_AUTO EUPDATES_MAX_AGE TERMINAL
 # Syncing is tested on its own at the end; the rest count the system tree.
 export XDG_CACHE_HOME="$T/cache" EUPDATES_NOTIFY=0 EUPDATES_SYNC=0
 E="$T/eupdates"
