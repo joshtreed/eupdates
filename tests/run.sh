@@ -58,7 +58,7 @@ bad() {
 expect() { # name, expected, actual
     if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$2', got '$3')"; fi
 }
-runs() { [ -f "$S/runs" ] && wc -l <"$S/runs" | tr -d ' ' || echo 0; }
+runs() { if [ -f "$S/runs" ]; then wc -l <"$S/runs" | tr -d ' '; else echo 0; fi; }
 wait_idle() { # until no check holds the lock (fake emerge finished)
     i=0
     while [ "$i" -lt 50 ]; do
@@ -156,7 +156,7 @@ expect "check once emerge is gone" 8 "$(runs)"
 
 # 8. Failing emerge: cache kept, and no retry storm afterwards.
 echo 1 >"$S/exit"
-"$E" check 2>/dev/null && bad "failed check exits 0" || ok "failed check exits non-zero"
+if "$E" check 2>/dev/null; then bad "failed check exits 0"; else ok "failed check exits non-zero"; fi
 expect "failed check keeps old count" 3 "$("$E" --no-auto)"
 r=$(runs)
 "$E" >/dev/null
@@ -173,7 +173,7 @@ r=$(runs)
 "$E" check 2>"$T/err"
 wait "$bg"
 expect "concurrent check skipped" "$r" "$(runs)"
-grep -q "already running" "$T/err" && ok "concurrent check says so" || bad "concurrent check message"
+if grep -q "already running" "$T/err"; then ok "concurrent check says so"; else bad "concurrent check message"; fi
 
 # 9b. How emerge was run: argv without a shell, output pinned, the user's
 # EMERGE_DEFAULT_OPTS kept (it decides what a real upgrade merges), stdin
@@ -206,11 +206,19 @@ WATCH=
 expect "watch lines" "$(printf '3\n1')" "$(cat "$T/watch.out")"
 
 # 12. watch exits when the bar closes its pipe.
-timeout 10 sh -c "\"$E\" watch --no-auto | head -n1 >/dev/null" && ok "watch exits on closed pipe" || bad "watch lingers after its reader closes"
+if timeout 10 sh -c "\"$E\" watch --no-auto | head -n1 >/dev/null"; then
+    ok "watch exits on closed pipe"
+else
+    bad "watch lingers after its reader closes"
+fi
 
 # 13. Bad arguments.
-"$E" --format 2>/dev/null && bad "--format without arg accepted" || ok "--format needs an argument"
-"$E" bogus 2>/dev/null && bad "unknown command accepted" || ok "unknown command rejected"
+if "$E" --format 2>/dev/null; then bad "--format without arg accepted"; else ok "--format needs an argument"; fi
+if "$E" bogus 2>/dev/null; then bad "unknown command accepted"; else ok "unknown command rejected"; fi
 
 echo
-[ "$fails" -eq 0 ] && echo "all tests passed" || { echo "$fails failed"; exit 1; }
+if [ "$fails" -ne 0 ]; then
+    echo "$fails failed"
+    exit 1
+fi
+echo "all tests passed"
