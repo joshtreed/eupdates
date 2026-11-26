@@ -14,11 +14,10 @@ eupdates - count pending Gentoo package updates, for any status bar
 display in any status bar: waybar, polybar, i3blocks, eww, yambar, tmux, conky,
 a dwm status script, or anything else that shows a command's output.
 
-It resolves the update set with *emerge*(1) *--pretend* against the
-*already-synced* local portage tree and installed database only, so the count
-matches what a real *emerge -uDN @world* would merge. It never contacts a
-mirror: the only mirror-hitting operation on Gentoo is *emerge --sync*, which
-*eupdates* deliberately does not perform.
+It resolves the update set with *emerge*(1) *--pretend* against the portage
+tree and installed database, so the count matches what a real
+*emerge -uDN @world* would merge. When nobody has synced the tree for a while,
+it syncs a copy of its own; see SYNCING.
 
 *emerge* is run directly, without a shell, and with the user's own portage
 settings: *EMERGE_DEFAULT_OPTS* such as *--with-bdeps=y* change what a real
@@ -56,6 +55,39 @@ To decide for yourself when checks run, pass *--no-auto* (or set
 *EUPDATES_AUTO=0*) and run *eupdates check* from cron, a timer or by hand, as
 the user whose bar shows the count (the cache is per user).
 
+# SYNCING
+
+A count against a tree nobody syncs never changes, and an ordinary user cannot
+sync the system tree. So when a repository's system copy was last synced more
+than two days ago, *eupdates* keeps its own copy of that repository under
+_$XDG_CACHE_HOME/eupdates/repos_ and syncs it during a check: at most once a
+day per repository, as Gentoo's mirrors ask, and no sooner than an hour after a
+failed attempt. The first copy of the gentoo tree takes about as much disk as
+the system's; later syncs fetch only what changed.
+
+Only repositories that portage itself syncs with *rsync* or *git* and that do
+not set *auto-sync = no* are copied; the rest are always read from the system.
+The settings come from _repos.conf_:
+
+- rsync: *sync-uri*, and when *sync-rsync-verify-metamanifest* is on, the
+  snapshot is checked with *gemato*(1) against *sync-openpgp-key-path*, must be
+  no older than *sync-rsync-verify-max-age* days, and must not be older than
+  the copy it replaces.
+- git: *sync-uri* and *sync-branch*; when *sync-git-verify-commit-signature* is
+  on, the fetched commit's signature is checked before it is checked out.
+
+A snapshot that fails any check is discarded and the previous copy kept.
+
+The copies are read only by this user's *emerge --pretend* and *glsa-check*,
+through a private *PORTAGE_CONFIGROOT* whose _etc/portage_ links to the real one
+except for _repos.conf_ and _make.profile_. A copy is used only while it is
+newer than the system's, so once anyone syncs the system tree, that is what
+counts again. Nothing running as root ever reads them: when the count came from
+a copy, *upgrade* runs *emerge --sync* before merging.
+
+*--no-sync* (or *EUPDATES_SYNC=0*) turns this off: the count then comes from
+the system tree alone, and the _repos_ directory can be deleted.
+
 # COMMANDS
 
 *status*
@@ -81,8 +113,9 @@ the user whose bar shows the count (the cache is per user).
 	installed version where there is one. For popups and menus.
 
 *upgrade*
-	Launch *$TERMINAL* running an interactive *emerge* upgrade of *@world*,
-	then run *check*.
+	Launch *$TERMINAL* running an interactive *emerge* upgrade of *@world*
+	(preceded by *emerge --sync* when the count came from eupdates' own copy
+	of a repository), then run *check*.
 
 # OPTIONS
 
@@ -103,6 +136,9 @@ the user whose bar shows the count (the cache is per user).
 
 *--no-auto*
 	Never start a check on its own; see KEEPING THE COUNT CURRENT.
+
+*--no-sync*
+	Never sync; count against the system tree as it is. See SYNCING.
 
 *--notify*
 	Send a desktop notification (via *notify-send*) when the pending count
@@ -127,6 +163,9 @@ the user whose bar shows the count (the cache is per user).
 
 *EUPDATES_MAX_AGE*
 	Start a check at least every this many hours (default: *24*).
+
+*EUPDATES_SYNC*
+	*0* has the same effect as *--no-sync*.
 
 *EUPDATES_NOTIFY*
 	When set to a non-empty value other than *0*, behave as if *--notify*
@@ -165,7 +204,7 @@ Waybar with tooltip and CSS classes:
 
 # SEE ALSO
 
-*emerge*(1), *eix*(1), *glsa-check*(1)
+*emerge*(1), *gemato*(1), *glsa-check*(1), *portage*(5)
 
 # AUTHORS
 

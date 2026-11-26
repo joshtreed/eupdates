@@ -21,7 +21,7 @@ jobs:
     container: alpine:latest
     steps:
       - uses: actions/checkout@v4
-      - run: apk add --no-cache build-base musl-dev
+      - run: apk add --no-cache build-base musl-dev rsync git
       - name: build (musl)
         run: make CC=gcc CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -pedantic" eupdates
       - run: ./eupdates --version

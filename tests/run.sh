@@ -19,7 +19,20 @@ mkdir -p "$T/cache" "$T/proc" "$S/repos/gentoo/metadata" "$S/repos/ov/.git" \
     "$S/portage/repos.conf" "$S/portage/package.use" "$S/portage/gnupg"
 touch "$S/repos/gentoo/metadata/timestamp.chk" "$S/repos/ov/.git/FETCH_HEAD" "$S/world" \
     "$S/mtimedb" "$S/portage/package.use/local" "$S/portage/gnupg/pubring.kbx"
-printf '[DEFAULT]\nmain-repo = gentoo\n\n[gentoo]\nlocation = %s/repos/gentoo\n' "$S" >"$S/repos.default"
+mkdir -p "$S/repos/gentoo/profiles/default/linux"
+ln -s "$S/repos/gentoo/profiles/default/linux" "$S/portage/make.profile"
+cat >"$S/repos.default" <<EOF
+[DEFAULT]
+main-repo = gentoo
+
+[gentoo]
+location = $S/repos/gentoo
+sync-type = rsync
+sync-uri = $S/mirror/gentoo
+sync-rsync-verify-metamanifest = yes
+sync-rsync-verify-max-age = 3
+sync-openpgp-key-path = $S/key.asc
+EOF
 printf '[ov]\n  location=%s/repos/ov  \n' "$S" >"$S/portage/repos.conf/ov.conf"
 cat >"$S/emerge" <<'EOF'
 #!/bin/sh
@@ -27,12 +40,25 @@ d=$(dirname "$0")
 echo run >>"$d/runs"
 printf '%s|%s|%s|%s\n' "$*" "${NOCOLOR-}" "${LC_ALL-}" "${EMERGE_DEFAULT_OPTS-}" >"$d/how"
 read -r leaked && echo "stdin:$leaked" >>"$d/how"
+echo "${PORTAGE_CONFIGROOT-}" >"$d/root"
 sleep "${FAKE_SLEEP:-1}"
 cat "$d/output"
 exit "$(cat "$d/exit")"
 EOF
 printf '#!/bin/sh\necho 202601-01\n' >"$S/glsa-check"
-chmod +x "$S/emerge" "$S/glsa-check"
+# gemato records how it was run and passes or fails on demand; the terminal
+# records the command `upgrade` gave it.
+cat >"$S/gemato" <<'EOF'
+#!/bin/sh
+echo "$*" >>"${0%/*}/gemato.how"
+exit "$(cat "${0%/*}/gemato.exit")"
+EOF
+cat >"$S/term" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"${0%/*}/term.how"
+EOF
+echo 0 >"$S/gemato.exit"
+chmod +x "$S/emerge" "$S/glsa-check" "$S/gemato" "$S/term"
 cat >"$S/output" <<'EOF'
 These are the packages that would be merged, in order:
 [ebuild     U  ] sys-libs/zlib-1.4::gentoo [1.3.2-r1::gentoo] USE="-minizip" 0 KiB
@@ -44,10 +70,11 @@ echo 0 >"$S/exit"
 $CC -O2 -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L \
     -DEUPDATES_EMERGE="\"$S/emerge\"" -DEUPDATES_GLSA="\"$S/glsa-check\"" \
     -DEUPDATES_PORTAGE_DIR="\"$S/portage\"" -DEUPDATES_REPOS_DEFAULT="\"$S/repos.default\"" \
-    -DEUPDATES_WORLD="\"$S/world\"" \
+    -DEUPDATES_WORLD="\"$S/world\"" -DEUPDATES_GEMATO="\"$S/gemato\"" -DEUPDATES_SYSTEM_FRESH=2 \
     -DEUPDATES_MTIMEDB="\"$S/mtimedb\"" -DEUPDATES_PROC="\"$T/proc\"" -o "$T/eupdates" src/eupdates.c
 
-export XDG_CACHE_HOME="$T/cache" EUPDATES_NOTIFY=0
+# Syncing is tested on its own at the end; the rest count the system tree.
+export XDG_CACHE_HOME="$T/cache" EUPDATES_NOTIFY=0 EUPDATES_SYNC=0
 E="$T/eupdates"
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -216,6 +243,137 @@ fi
 if "$E" --format 2>/dev/null; then bad "--format without arg accepted"; else ok "--format needs an argument"; fi
 if "$E" bogus 2>/dev/null; then bad "unknown command accepted"; else ok "unknown command rejected"; fi
 
+# 14. Self-sync. A mirror for the gentoo tree (rsync, Manifest-verified) and
+# an upstream for a git overlay; the system copies go stale after 2 s here.
+export EUPDATES_SYNC=1
+C="$T/cache/eupdates"
+gm() { if [ -f "$S/gemato.how" ]; then wc -l <"$S/gemato.how" | tr -d ' '; else echo 0; fi; }
+stamp() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; } # seconds ago
+mirror() { # content, Manifest age in seconds
+    mkdir -p "$S/mirror/gentoo/metadata" "$S/mirror/gentoo/profiles/default/linux"
+    echo "$1" >"$S/mirror/gentoo/pkg"
+    printf 'MANIFEST pkg 1\nTIMESTAMP %s\n' "$(stamp "$2")" >"$S/mirror/gentoo/Manifest"
+    touch "$S/mirror/gentoo/metadata/timestamp.chk"
+}
+G() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@"; }
+mkdir -p "$S/upstream/gitov"
+G -C "$S/upstream/gitov" init -q
+echo one >"$S/upstream/gitov/file"
+G -C "$S/upstream/gitov" add file && G -C "$S/upstream/gitov" commit -qm one
+G clone -q "$S/upstream/gitov" "$S/repos/gitov"
+printf '[gitov]\nlocation = %s/repos/gitov\nsync-type = git\nsync-uri = %s/upstream/gitov\n' \
+    "$S" "$S" >"$S/portage/repos.conf/gitov.conf"
+echo two >"$S/upstream/gitov/file"
+G -C "$S/upstream/gitov" commit -qam two
+mirror v1 60
+sleep 2.1
+
+# 14a. Stale system tree -> our copies are synced, verified and used.
+"$E" check >/dev/null 2>"$T/err" || true
+expect "rsync copy synced" v1 "$(cat "$C/repos/gentoo/pkg" 2>/dev/null)"
+expect "gemato verified the new snapshot" "verify -q -s -K $S/key.asc $C/repos/gentoo.new" \
+    "$(cat "$S/gemato.how" 2>/dev/null)"
+expect "git copy synced" two "$(cat "$C/repos/gitov/file" 2>/dev/null)"
+expect "emerge pointed at our config root" "$C/root" "$(cat "$S/root")"
+if grep -q "^location = $C/repos/gentoo\$" "$C/root/etc/portage/repos.conf/b-eupdates.conf" &&
+    grep -q "^location = $C/repos/gitov\$" "$C/root/etc/portage/repos.conf/b-eupdates.conf"; then
+    ok "repos.conf re-points both repositories"
+else
+    bad "repos.conf: $(cat "$C/root/etc/portage/repos.conf/b-eupdates.conf" 2>&1)"
+fi
+expect "profile follows the tree" "$C/repos/gentoo/profiles/default/linux" \
+    "$(readlink "$C/root/etc/portage/make.profile")"
+expect "user config linked through" "$S/portage/package.use" \
+    "$(readlink "$C/root/etc/portage/package.use")"
+expect "no stray errors" "" "$(cat "$T/err")"
+
+# 14b. Again right away -> no second sync (once a day).
+mirror v2 30
+echo three >"$S/upstream/gitov/file"
+G -C "$S/upstream/gitov" commit -qam three
+"$E" check >/dev/null 2>&1 || true
+expect "no resync within a day (rsync)" 1 "$(gm)"
+expect "no resync within a day (git)" two "$(cat "$C/repos/gitov/file")"
+
+# 14c. A day later -> synced again, unchanged files hard-linked not re-sent.
+age "$C/repos/.gentoo.synced" 86400
+age "$C/repos/.gitov.synced" 86400
+"$E" check >/dev/null 2>&1 || true
+expect "daily resync (rsync)" v2 "$(cat "$C/repos/gentoo/pkg")"
+expect "daily resync (git)" three "$(cat "$C/repos/gitov/file")"
+if [ ! -e "$C/repos/gentoo.new" ] && [ ! -e "$C/repos/gentoo.old" ]; then
+    ok "swap leaves no staging dirs"
+else bad "staging dirs left behind"; fi
+
+# 14d. Verification fails -> old copy kept, retried after an hour, not before.
+echo 1 >"$S/gemato.exit"
+mirror evil 10
+age "$C/repos/.gentoo.synced" 86400
+"$E" check >/dev/null 2>"$T/err" || true
+expect "bad signature keeps old copy" v2 "$(cat "$C/repos/gentoo/pkg")"
+if grep -q "verification failed" "$T/err"; then ok "says verification failed"; else bad "no verification error"; fi
+n=$(gm)
+"$E" check >/dev/null 2>&1 || true
+expect "no retry within the hour" "$n" "$(gm)"
+age "$C/repos/.gentoo.tried" 3601
+"$E" check >/dev/null 2>&1 || true
+expect "retried after an hour" $((n + 1)) "$(gm)"
+echo 0 >"$S/gemato.exit"
+
+# 14e. Signed but stale (past max-age) or older than ours -> rejected.
+mirror old $((4 * 86400))
+age "$C/repos/.gentoo.synced" 86400
+age "$C/repos/.gentoo.tried" 86400
+"$E" check >/dev/null 2>&1 || true
+expect "snapshot past max-age rejected" v2 "$(cat "$C/repos/gentoo/pkg")"
+mirror rollback 86400
+age "$C/repos/.gentoo.tried" 86400
+"$E" check >/dev/null 2>&1 || true
+expect "rollback rejected" v2 "$(cat "$C/repos/gentoo/pkg")"
+
+# 14f. A git commit whose signature fails -> old checkout kept.
+printf 'sync-git-verify-commit-signature = yes\nsync-openpgp-key-path = %s/key.asc\n' "$S" \
+    >>"$S/portage/repos.conf/gitov.conf"
+echo 1 >"$S/gemato.exit"
+echo four >"$S/upstream/gitov/file"
+G -C "$S/upstream/gitov" commit -qam four
+age "$C/repos/.gitov.synced" 86400
+"$E" check >/dev/null 2>&1 || true
+expect "unsigned git commit not checked out" three "$(cat "$C/repos/gitov/file")"
+echo 0 >"$S/gemato.exit"
+age "$C/repos/.gitov.tried" 86400
+"$E" check >/dev/null 2>&1 || true
+expect "signed git commit checked out" four "$(cat "$C/repos/gitov/file")"
+
+# 14g. A swap cut short (copy moved aside, never moved back) heals.
+mirror v3 20
+mv "$C/repos/gentoo" "$C/repos/gentoo.old"
+age "$C/repos/.gentoo.synced" 86400
+age "$C/repos/.gentoo.tried" 86400
+"$E" check >/dev/null 2>&1 || true
+expect "interrupted swap recovered" v3 "$(cat "$C/repos/gentoo/pkg" 2>/dev/null)"
+
+# 14h. upgrade syncs the system tree first when the count came from our copy.
+TERMINAL="$S/term" "$E" upgrade >/dev/null 2>&1 || true
+case $(cat "$S/term.how") in *"sudo emerge --sync && sudo emerge --ask"*) ok "upgrade syncs first" ;;
+*) bad "upgrade command: $(cat "$S/term.how")" ;; esac
+
+# 14i. --no-sync / EUPDATES_SYNC=0: no syncing, system tree used as is.
+age "$C/repos/.gentoo.synced" 86400
+age "$C/repos/.gentoo.tried" 86400
+n=$(gm)
+"$E" check --no-sync >/dev/null 2>&1 || true
+EUPDATES_SYNC=0 "$E" check >/dev/null 2>&1 || true
+expect "--no-sync syncs nothing" "$n" "$(gm)"
+expect "--no-sync reads the system tree" "" "$(cat "$S/root")"
+TERMINAL="$S/term" "$E" upgrade --no-sync >/dev/null 2>&1 || true
+case $(cat "$S/term.how") in *"emerge --sync"*) bad "upgrade --no-sync syncs" ;; *) ok "upgrade --no-sync does not sync" ;; esac
+
+# 14j. Someone synced the system tree -> it is newer than ours, so it wins.
+touch "$S/repos/gentoo/metadata/timestamp.chk" "$S/repos/gitov/.git/FETCH_HEAD"
+"$E" check >/dev/null 2>&1 || true
+expect "fresh system tree is used, not synced" "$n" "$(gm)"
+expect "fresh system tree: no config root" "" "$(cat "$S/root")"
 echo
 if [ "$fails" -ne 0 ]; then
     echo "$fails failed"
