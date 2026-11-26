@@ -1,15 +1,23 @@
 # i3blocks
 
-Using the `contrib/eupdates-count.sh` helper (on `PATH`):
+Streaming (updates as soon as the count changes):
 
 ```ini
 [updates]
-command=eupdates-count.sh
-interval=3600
-label= 
+command=eupdates watch --format 'pkg {count}'
+interval=persist
 ```
 
-`eupdates-count.sh` prints a bare integer. Refresh the underlying cache with
-`eupdates check` from a timer (see `../systemd/`). To upgrade on click, wrap in
-your own script that runs `eupdates upgrade` for the desired mouse button
-(`$BLOCK_BUTTON`).
+In `persist` mode i3blocks sends clicks to the command's standard input rather
+than running it again, so this block does not react to clicks. If you want
+clicks, poll instead:
+
+```ini
+[updates]
+command=case $BLOCK_BUTTON in 1) eupdates check --notify >/dev/null & ;; 3) eupdates upgrade >/dev/null & ;; esac; eupdates --format 'pkg {count}'
+interval=60
+```
+
+Polling every 60 seconds is cheap: `eupdates` reads a small cache file and only
+starts a background check when the tree was synced, an emerge finished, or the
+world file changed.

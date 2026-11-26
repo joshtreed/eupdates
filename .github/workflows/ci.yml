@@ -13,6 +13,8 @@ jobs:
         run: make CC=${{ matrix.cc }} CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -pedantic" eupdates
       - name: smoke test
         run: ./eupdates --version && ./eupdates --help
+      - name: tests (${{ matrix.cc }})
+        run: make test CC=${{ matrix.cc }}
 
   musl:
     runs-on: ubuntu-latest
@@ -23,6 +25,7 @@ jobs:
       - name: build (musl)
         run: make CC=gcc CFLAGS="-O2 -std=c11 -Wall -Wextra -Werror -pedantic" eupdates
       - run: ./eupdates --version
+      - run: make test CC=gcc
 
   lint:
     runs-on: ubuntu-latest
@@ -33,7 +36,7 @@ jobs:
         run: clang-format --dry-run -Werror src/*.c
       - name: shellcheck contrib scripts
         run: |
-          files=$(git ls-files 'contrib/**/*.sh')
+          files=$(git ls-files '*.sh')
           [ -z "$files" ] || shellcheck $files
       - name: man page builds
         run: scdoc < doc/eupdates.1.scd > /dev/null

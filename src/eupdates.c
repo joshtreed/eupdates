@@ -1,25 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * eupdates - count pending Gentoo (portage) package updates for status bars.
+ * eupdates - count pending Gentoo (portage) package updates, for any status bar.
  *
- *   check    resolve the @world upgrade set, cache the list, signal waybar
- *   status   emit waybar JSON from the cache (default; no work, instant)
+ *   status   print the count once from the cache (default; instant)
+ *   watch    keep running; print a new line whenever the output changes
+ *   check    resolve the @world upgrade set now and refresh the cache
+ *   list     print the cached list of pending packages
  *   upgrade  run the upgrade in $TERMINAL, then re-check
+ *
+ * Bars either poll a command (tmux, conky, i3status-rust...) or keep one
+ * running and read its lines (waybar, polybar tail, i3blocks persist, eww...).
+ * `status` serves the first kind, `watch` the second. Both refresh the cache on
+ * their own -- a background check starts when the tree was synced, an emerge
+ * finished, the world file changed, or the last check is older than a day -- so
+ * no timer, cron job or init-system unit is needed. --no-auto turns that off for
+ * people who would rather run `eupdates check` themselves.
  *
  * It NEVER contacts a mirror. `emerge --pretend` resolves against the
  * already-synced local tree + installed db only. The only rate-limited,
  * mirror-hitting operation on Gentoo is `emerge --sync`, which is deliberately
- * left out. The tooltip reports how stale the tree is so a sync stays a
- * deliberate act.
+ * left out.
  *
  * Copyright 2026 Josh Reed. GNU GPL v3 or later; see LICENSE.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -30,37 +44,37 @@
 #define EUPDATES_VERSION "0.1.0"
 #endif
 
-/* Offline: resolves the local tree only, never fetches. */
-static const char *EMERGE_CMD =
-    "emerge --pretend --update --deep --newuse --color=n --nospinner @world 2>/dev/null";
-/* Offline: reads the local GLSA metadata shipped with the tree. */
-static const char *GLSA_CMD = "glsa-check --test affected 2>/dev/null";
-static const char *TREE_TS = "/var/db/repos/gentoo/metadata/timestamp.chk";
-/* Rewritten by portage once per merge/unmerge; what --settle waits out.
- * Overridable at build time so the settle path can be tested without root. */
-#ifndef EUPDATES_MTIMEDB
+/* Every system path is overridable at build time so the tests can run without
+ * root and without a real two-minute resolve. */
+#ifndef EUPDATES_EMERGE_CMD /* offline: resolves the local tree only */
+#define EUPDATES_EMERGE_CMD                                                                \
+    "emerge --pretend --update --deep --newuse --color=n --nospinner @world 2>/dev/null"
+#endif
+#ifndef EUPDATES_GLSA_CMD /* offline: reads GLSA metadata shipped with the tree */
+#define EUPDATES_GLSA_CMD "glsa-check --test affected 2>/dev/null"
+#endif
+#ifndef EUPDATES_TREE_TS /* rewritten by every sync */
+#define EUPDATES_TREE_TS "/var/db/repos/gentoo/metadata/timestamp.chk"
+#endif
+#ifndef EUPDATES_MTIMEDB /* rewritten by portage once per merge/unmerge */
 #define EUPDATES_MTIMEDB "/var/cache/edb/mtimedb"
 #endif
-static const char *MTIMEDB = EUPDATES_MTIMEDB;
+#ifndef EUPDATES_PROC /* where to look for a running emerge/emaint */
+#define EUPDATES_PROC "/proc"
+#endif
+#ifndef EUPDATES_WORLD /* the @world selection */
+#define EUPDATES_WORLD "/var/lib/portage/world"
+#endif
 
-static const char *ICON = "\xf3\xb0\x8f\x97";       /* U+F03D7 nf-md-package_up */
-static const char *CHECK_ICON = "\xf3\xb0\x91\x90"; /* U+F0450 nf-md-refresh   */
+static const char *DEFAULT_FORMAT = "{count}";
 static const int CHECKING_STALE = 300; /* drop a stuck "checking" marker past this (s) */
-static const int PREVIEW = 25;         /* tooltip package lines before eliding  */
-static const int STALE_DAYS = 2;       /* nag about syncing past this age       */
+static const int MERGE_QUIET = 60;     /* portage idle this long after a merge (s)     */
+static const int DEFAULT_MAX_AGE = 24; /* re-check at least this often (hours)         */
+static const int WATCH_TICK = 2;       /* watch: seconds between looks at the cache    */
+static const int PREVIEW = 25;         /* tooltip package lines before eliding         */
+static const int STALE_DAYS = 2;       /* nag about syncing past this age (days)       */
 
-/* waybar "signal": N maps to SIGRTMIN+N; overridable for other setups. */
-static int waybar_signal(void) {
-    const char *e = getenv("EUPDATES_WAYBAR_SIGNAL");
-    if (e && *e) {
-        char *end;
-        long v = strtol(e, &end, 10);
-        if (*end == '\0' && v >= 1 && v <= 15) return (int)v;
-    }
-    return 8;
-}
-
-/* ---- cache paths --------------------------------------------------------- */
+/* ---- small helpers ------------------------------------------------------- */
 
 static void cache_path(char *buf, size_t n, const char *leaf) {
     const char *xdg = getenv("XDG_CACHE_HOME");
@@ -72,7 +86,7 @@ static void cache_path(char *buf, size_t n, const char *leaf) {
 }
 
 static void ensure_cache_dir(void) {
-    char dir[512];
+    char dir[4096];
     const char *xdg = getenv("XDG_CACHE_HOME");
     const char *home = getenv("HOME");
     if (xdg && *xdg) {
@@ -86,105 +100,50 @@ static void ensure_cache_dir(void) {
         fprintf(stderr, "eupdates: mkdir %s: %s\n", dir, strerror(errno));
 }
 
-/* ---- JSON string emission ------------------------------------------------ */
-
-static void json_escape(const char *s) {
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        switch (c) {
-        case '"': fputs("\\\"", stdout); break;
-        case '\\': fputs("\\\\", stdout); break;
-        case '\n': fputs("\\n", stdout); break;
-        case '\r': fputs("\\r", stdout); break;
-        case '\t': fputs("\\t", stdout); break;
-        default:
-            if (c < 0x20)
-                printf("\\u%04x", c); /* other control chars   */
-            else
-                putchar(c); /* UTF-8 bytes pass thru */
-        }
-    }
+/* mtime of a path, or 0 if it can't be stat'ed. */
+static time_t mtime_of(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_mtime : 0;
 }
 
-static void emit(const char *text, const char *tooltip, const char *cls) {
-    fputs("{\"text\":\"", stdout);
-    json_escape(text);
-    fputs("\",\"tooltip\":\"", stdout);
-    json_escape(tooltip);
-    printf("\",\"class\":\"%s\"}\n", cls);
+static void touch(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (f) fclose(f);
 }
 
-/* ---- check --------------------------------------------------------------- */
-
-/* Write one tooltip line for an `[ebuild ...] atom [old] ...` merge line.
- * Returns 1 if a package line was written, 0 otherwise. */
-static int format_pkg(const char *line, FILE *out) {
-    const char *p = strchr(line, ']');
-    if (!p) return 0;
-    p++;
-    while (*p == ' ' || *p == '\t')
-        p++;
-    if (*p == '\0' || *p == '\n') return 0;
-
-    const char *as = p, *ae = p; /* new atom cat/pkg-ver */
-    while (*ae && !isspace((unsigned char)*ae) && *ae != ':')
-        ae++;
-    if (ae == as) return 0;
-
-    const char *ob = NULL, *oe = NULL; /* [oldver] if present  */
-    for (const char *q = ae; *q && *q != '\n'; q++) {
-        if (strncmp(q, "USE=", 4) == 0) break; /* past the version cols */
-        if (*q == '[') {
-            const char *r = q + 1, *re = q + 1;
-            while (*re && !isspace((unsigned char)*re) && *re != ':' && *re != ']')
-                re++;
-            ob = r;
-            oe = re;
-            break;
-        }
+static int count_lines(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    int n = 0, c, prev = '\n';
+    while ((c = fgetc(fp)) != EOF) {
+        if (c == '\n') n++;
+        prev = c;
     }
-
-    fwrite(as, 1, (size_t)(ae - as), out);
-    if (ob && oe > ob) {
-        fputs("  (was ", out);
-        fwrite(ob, 1, (size_t)(oe - ob), out);
-        fputc(')', out);
-    }
-    fputc('\n', out);
-    return 1;
-}
-
-static int count_glsa(void) {
-    FILE *fp = popen(GLSA_CMD, "r");
-    if (!fp) return 0;
-    int n = 0;
-    char *line = NULL;
-    size_t cap = 0;
-    while (getline(&line, &cap, fp) != -1)
-        if (isdigit((unsigned char)line[0])) n++; /* affected GLSA ids */
-    free(line);
-    pclose(fp);
+    if (prev != '\n') n++; /* last line without a newline */
+    fclose(fp);
     return n;
 }
 
-static void signal_waybar(void) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        char sig[16];
-        snprintf(sig, sizeof sig, "-RTMIN+%d", waybar_signal());
-        execlp("pkill", "pkill", "-x", sig, "waybar", (char *)NULL);
-        _exit(127);
-    } else if (pid > 0) {
-        int st;
-        waitpid(pid, &st, 0); /* absent waybar -> nonzero, harmless */
-    }
+static int read_int_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    int v = 0;
+    if (fscanf(fp, "%d", &v) != 1) v = 0;
+    fclose(fp);
+    return v;
 }
 
-static int count_lines(const char *path, time_t *mtime); /* defined below */
+static int tree_age_days(void) {
+    time_t t = mtime_of(EUPDATES_TREE_TS);
+    if (!t) return -1;
+    double d = difftime(time(NULL), t) / 86400.0;
+    return d < 0 ? 0 : (int)d;
+}
+
+/* ---- notifications ------------------------------------------------------- */
 
 /* Best-effort desktop notification; silently a no-op if notify-send is absent.
- * The icon is an XDG icon-theme name (resolved by the notification daemon) or an
- * absolute image path; override with EUPDATES_ICON. */
+ * The icon is an XDG icon-theme name or an absolute image path (EUPDATES_ICON). */
 static void send_notify(const char *urgency, const char *body) {
     const char *icon = getenv("EUPDATES_ICON");
     if (!icon || !*icon) icon = "system-software-update";
@@ -199,20 +158,15 @@ static void send_notify(const char *urgency, const char *body) {
     }
 }
 
-static int notify_enabled(int cli_notify, int cli_no_notify) {
-    if (cli_no_notify) return 0;
-    if (cli_notify) return 1;
-    const char *e = getenv("EUPDATES_NOTIFY");
-    return e && *e && strcmp(e, "0") != 0;
+static int env_flag(const char *name, int dflt) {
+    const char *e = getenv(name);
+    if (!e || !*e) return dflt;
+    return strcmp(e, "0") != 0;
 }
 
-/* Compare old vs new pending count and notify per the rules.
- *
- * A background refresh (timer or path unit) reports only a count that ROSE, or
- * the first-ever count: a count that fell is the result of an emerge the user
- * just ran by hand, so announcing it tells them something they already know.
- * A manual check reports every outcome, "no change" included, because it was
- * asked for. */
+/* A background check reports only a count that ROSE, or the first count ever:
+ * a count that fell is the user's own emerge, so it is not news. A manual
+ * check reports every outcome, "no change" included, because it was asked for. */
 static void notify_result(int old, int now, int manual) {
     char body[128];
     if (!manual && old >= 0 && now <= old) return;
@@ -234,230 +188,437 @@ static void notify_result(int old, int now, int manual) {
     }
 }
 
-/* Block until portage's mtimedb has gone `secs` seconds without a write.
- *
- * portage rewrites mtimedb once per merged package, and a .path unit re-arms as
- * soon as the service it triggers exits -- so a bare path-triggered check turns
- * one long emerge into a back-to-back resolve treadmill that competes with the
- * compile. Waiting here instead keeps this unit active (which is what holds the
- * path unit off) and costs nothing while it waits, so an emerge of any length
- * yields exactly one resolve, once it is done. */
-static void settle(int secs) {
-    struct stat st;
-    for (;;) {
-        if (stat(MTIMEDB, &st) != 0) return; /* absent or unreadable: nothing to wait on */
-        time_t age = time(NULL) - st.st_mtime;
-        if (age < 0) age = 0; /* clock skew: treat a future mtime as "just now" */
-        if (age >= secs) return;
-        sleep((unsigned)(secs - age));
+/* ---- check --------------------------------------------------------------- */
+
+/* Write one list line for an `[ebuild ...] atom [old] ...` merge line.
+ * Returns 1 if a package line was written, 0 otherwise. */
+static int format_pkg(const char *line, FILE *out) {
+    const char *p = strchr(line, ']');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == '\0' || *p == '\n') return 0;
+
+    const char *as = p, *ae = p; /* new atom cat/pkg-ver */
+    while (*ae && !isspace((unsigned char)*ae) && *ae != ':')
+        ae++;
+    if (ae == as) return 0;
+
+    const char *ob = NULL, *oe = NULL; /* [oldver] if present */
+    for (const char *q = ae; *q && *q != '\n'; q++) {
+        if (strncmp(q, "USE=", 4) == 0) break; /* past the version columns */
+        if (*q == '[') {
+            const char *re = q + 1;
+            while (*re && !isspace((unsigned char)*re) && *re != ':' && *re != ']')
+                re++;
+            ob = q + 1;
+            oe = re;
+            break;
+        }
     }
+
+    fwrite(as, 1, (size_t)(ae - as), out);
+    if (ob && oe > ob) {
+        fputs("  (was ", out);
+        fwrite(ob, 1, (size_t)(oe - ob), out);
+        fputc(')', out);
+    }
+    fputc('\n', out);
+    return 1;
 }
 
-static int cmd_check(int progress, int notify, int settle_secs) {
-    if (settle_secs > 0) settle(settle_secs);
-    ensure_cache_dir();
-    char list[512], tmp[512], sec[512], mark[512], tmpleaf[64];
-    cache_path(list, sizeof list, "list");
-    cache_path(sec, sizeof sec, "security");
-    cache_path(mark, sizeof mark, "checking");
-    snprintf(tmpleaf, sizeof tmpleaf, "list.%ld.tmp", (long)getpid());
-    cache_path(tmp, sizeof tmp, tmpleaf);
-
-    int old = count_lines(list, NULL); /* -1 if no prior cache */
-
-    if (progress) {
-        FILE *mf = fopen(mark, "w");
-        if (mf) fclose(mf);
-        signal_waybar(); /* show the "checking" state while we resolve */
-    }
-
-    FILE *out = fopen(tmp, "w");
-    if (!out) {
-        fprintf(stderr, "eupdates: %s: %s\n", tmp, strerror(errno));
-        if (progress) {
-            unlink(mark);
-            signal_waybar();
-        }
-        return 1;
-    }
-    FILE *fp = popen(EMERGE_CMD, "r");
-    if (!fp) {
-        fprintf(stderr, "eupdates: cannot run emerge\n");
-        fclose(out);
-        unlink(tmp);
-        if (progress) {
-            unlink(mark);
-            signal_waybar();
-        }
-        return 1;
-    }
+static int count_glsa(void) {
+    FILE *fp = popen(EUPDATES_GLSA_CMD, "r");
+    if (!fp) return 0;
+    int n = 0;
     char *line = NULL;
     size_t cap = 0;
-    int n = 0;
     while (getline(&line, &cap, fp) != -1)
-        if (strncmp(line, "[ebuild", 7) == 0 || strncmp(line, "[binary", 7) == 0)
-            n += format_pkg(line, out);
+        if (isdigit((unsigned char)line[0])) n++; /* affected GLSA ids */
     free(line);
-    int rc = pclose(fp);
-    fclose(out);
-
-    /* emerge failed (blockers, broken tree): keep the stale cache. */
-    if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
-        fprintf(stderr, "eupdates: emerge exited abnormally; keeping cache\n");
-        unlink(tmp);
-        if (progress) {
-            unlink(mark);
-            signal_waybar();
-        }
-        return 1;
-    }
-    if (rename(tmp, list) != 0) {
-        fprintf(stderr, "eupdates: rename: %s\n", strerror(errno));
-        unlink(tmp);
-        if (progress) {
-            unlink(mark);
-            signal_waybar();
-        }
-        return 1;
-    }
-
-    FILE *sf = fopen(sec, "w");
-    if (sf) {
-        fprintf(sf, "%d\n", count_glsa());
-        fclose(sf);
-    }
-
-    if (progress) unlink(mark);
-    signal_waybar();
-
-    if (notify) notify_result(old, n, progress);
-    return 0;
-}
-
-/* ---- status -------------------------------------------------------------- */
-
-static int count_lines(const char *path, time_t *mtime) {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    if (mtime) *mtime = st.st_mtime;
-    FILE *fp = fopen(path, "r");
-    if (!fp) return -1;
-    int n = 0, c;
-    int prev = '\n';
-    while ((c = fgetc(fp)) != EOF) {
-        if (c == '\n') n++;
-        prev = c;
-    }
-    if (prev != '\n' && n == 0) n = 1; /* trailing line without newline */
-    fclose(fp);
+    pclose(fp);
     return n;
 }
 
-static int read_int_file(const char *path) {
-    FILE *fp = fopen(path, "r");
-    if (!fp) return 0;
-    int v = 0;
-    if (fscanf(fp, "%d", &v) != 1) v = 0;
-    fclose(fp);
-    return v;
+/* Take the cache lock for the life of this process. Only one check runs at a
+ * time, however many bars, watchers and clicks ask for one. Returns 0 on
+ * success, 1 if another check holds it, -1 on error. */
+static int take_lock(void) {
+    char path[4096];
+    cache_path(path, sizeof path, "lock");
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return -1;
+    struct flock fl = {0};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    if (fcntl(fd, F_SETLK, &fl) == 0) return 0; /* fd stays open: lock held until exit */
+    int busy = (errno == EACCES || errno == EAGAIN);
+    close(fd);
+    return busy ? 1 : -1;
 }
 
-static int tree_age_days(void) {
-    struct stat st;
-    if (stat(TREE_TS, &st) != 0) return -1;
-    double d = difftime(time(NULL), st.st_mtime) / 86400.0;
-    return d < 0 ? 0 : (int)d;
+/* Resolve @world and replace the cache. `manual` = asked for by a person
+ * (shows the "checking" state and reports every outcome). */
+static int run_check(int manual, int notify) {
+    ensure_cache_dir();
+    int lk = take_lock();
+    if (lk == 1) {
+        if (manual) {
+            fputs("eupdates: a check is already running\n", stderr);
+            if (notify) send_notify("low", "A check is already running");
+        }
+        return 0;
+    }
+    if (lk < 0) {
+        fprintf(stderr, "eupdates: cannot lock the cache: %s\n", strerror(errno));
+        return 1;
+    }
+
+    char list[4096], tmp[4096], sec[4096], mark[4096], stamp[4096], tmpleaf[64];
+    cache_path(list, sizeof list, "list");
+    cache_path(sec, sizeof sec, "security");
+    cache_path(mark, sizeof mark, "checking");
+    cache_path(stamp, sizeof stamp, "attempt");
+    snprintf(tmpleaf, sizeof tmpleaf, "list.%ld.tmp", (long)getpid());
+    cache_path(tmp, sizeof tmp, tmpleaf);
+
+    /* Stamp the attempt first: a failed resolve still counts, so a broken tree
+     * is retried when something changes, not on every watch tick. */
+    touch(stamp);
+    int old = count_lines(list); /* -1 if no prior cache */
+    if (manual) touch(mark);     /* watchers show "checking" while we resolve */
+
+    int rc = 1, n = 0;
+    FILE *out = fopen(tmp, "w");
+    FILE *fp = out ? popen(EUPDATES_EMERGE_CMD, "r") : NULL;
+    if (!out) {
+        fprintf(stderr, "eupdates: %s: %s\n", tmp, strerror(errno));
+    } else if (!fp) {
+        fprintf(stderr, "eupdates: cannot run emerge\n");
+        fclose(out);
+    } else {
+        char *line = NULL;
+        size_t cap = 0;
+        while (getline(&line, &cap, fp) != -1)
+            if (strncmp(line, "[ebuild", 7) == 0 || strncmp(line, "[binary", 7) == 0)
+                n += format_pkg(line, out);
+        free(line);
+        int st = pclose(fp);
+        fclose(out);
+        /* emerge failed (blockers, broken tree): keep the old cache rather
+         * than report zero. */
+        if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+            fputs("eupdates: emerge exited abnormally; keeping cache\n", stderr);
+        else if (rename(tmp, list) != 0)
+            fprintf(stderr, "eupdates: rename: %s\n", strerror(errno));
+        else
+            rc = 0;
+    }
+    unlink(tmp); /* no-op after a successful rename */
+
+    if (rc == 0) {
+        FILE *sf = fopen(sec, "w");
+        if (sf) {
+            fprintf(sf, "%d\n", count_glsa());
+            fclose(sf);
+        }
+    }
+    if (manual) unlink(mark);
+    if (rc == 0 && notify) notify_result(old, n, manual);
+    return rc;
 }
 
-static int cmd_status(void) {
-    char list[512], sec[512], mark[512];
+/* ---- automatic refresh --------------------------------------------------- */
+
+/* Is an emerge or emaint running right now (a merge, a sync)? Linux /proc;
+ * anywhere else this answers "no" and the quiet-time rule still applies. */
+static int portage_busy(void) {
+    DIR *d = opendir(EUPDATES_PROC);
+    if (!d) return 0;
+    struct dirent *e;
+    int busy = 0;
+    while (!busy && (e = readdir(d))) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        char path[4096], comm[32] = "";
+        snprintf(path, sizeof path, "%s/%s/comm", EUPDATES_PROC, e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        if (fgets(comm, sizeof comm, f)) {
+            comm[strcspn(comm, "\n")] = '\0';
+            busy = strcmp(comm, "emerge") == 0 || strcmp(comm, "emaint") == 0;
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return busy;
+}
+
+static int max_age_secs(void) {
+    const char *e = getenv("EUPDATES_MAX_AGE");
+    if (e && *e) {
+        char *end;
+        long h = strtol(e, &end, 10);
+        if (*end == '\0' && h >= 1 && h <= 24 * 365) return (int)(h * 3600);
+    }
+    return DEFAULT_MAX_AGE * 3600;
+}
+
+/* Does the cache need a fresh resolve? Yes when there has never been an attempt,
+ * or since the last attempt the tree was synced, the world file changed, an
+ * emerge finished, or a day went by. Never while portage is mid-merge/sync:
+ * the answer would be stale before it landed. Only stat()s, so cheap enough
+ * for every poll and every watch tick. */
+static int out_of_date(void) {
+    char stamp[4096];
+    cache_path(stamp, sizeof stamp, "attempt");
+    time_t last = mtime_of(stamp), now = time(NULL);
+    time_t merged = mtime_of(EUPDATES_MTIMEDB);
+
+    int due = last == 0 || mtime_of(EUPDATES_TREE_TS) > last ||
+              mtime_of(EUPDATES_WORLD) > last || now - last >= max_age_secs() ||
+              (merged > last && now - merged >= MERGE_QUIET);
+    return due && !portage_busy();
+}
+
+/* Start one detached, niced check and return at once. Double-forked and in its
+ * own session, so it outlives a bar reload and leaves no zombie; the lock in
+ * run_check() turns any concurrent extras into no-ops. */
+static void spawn_check(int notify) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        if (fork() != 0) _exit(0);
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) close(fd);
+        }
+        setpriority(PRIO_PROCESS, 0, 15);
+        _exit(run_check(0, notify));
+    } else if (pid > 0) {
+        int st;
+        waitpid(pid, &st, 0);
+    }
+}
+
+/* ---- output -------------------------------------------------------------- */
+
+struct snapshot {
+    int count; /* -1 = no check has run yet */
+    int glsa;
+    int synced; /* days since tree sync, -1 unknown */
+    int checking;
+    const char *state;
+    time_t checked;
+};
+
+static void take_snapshot(struct snapshot *s) {
+    char list[4096], sec[4096], mark[4096];
     cache_path(list, sizeof list, "list");
     cache_path(sec, sizeof sec, "security");
     cache_path(mark, sizeof mark, "checking");
 
-    /* A manual `check --progress` is in flight: show a checking state. */
-    struct stat mst;
-    if (stat(mark, &mst) == 0) {
-        if (difftime(time(NULL), mst.st_mtime) < CHECKING_STALE) {
-            char text[64];
-            snprintf(text, sizeof text, "%s ", CHECK_ICON);
-            emit(text, "Checking for updates\xe2\x80\xa6", "checking");
-            return 0;
+    time_t m = mtime_of(mark);
+    s->checking = m && difftime(time(NULL), m) < CHECKING_STALE;
+    if (m && !s->checking) unlink(mark); /* a manual check died mid-flight */
+
+    s->count = count_lines(list);
+    s->checked = mtime_of(list);
+    s->glsa = read_int_file(sec);
+    s->synced = tree_age_days();
+    s->state = s->checking     ? "checking"
+               : s->count < 0  ? "unknown"
+               : s->count == 0 ? "updated"
+                               : "pending";
+}
+
+/* Expand {count} {glsa} {synced} {state}; anything else is copied as is. */
+static void expand(FILE *out, const char *tpl, const struct snapshot *s) {
+    for (const char *p = tpl; *p; p++) {
+        if (*p == '{') {
+            if (strncmp(p, "{count}", 7) == 0) {
+                if (s->count < 0)
+                    fputc('?', out);
+                else
+                    fprintf(out, "%d", s->count);
+                p += 6;
+                continue;
+            }
+            if (strncmp(p, "{glsa}", 6) == 0) {
+                fprintf(out, "%d", s->glsa);
+                p += 5;
+                continue;
+            }
+            if (strncmp(p, "{synced}", 8) == 0) {
+                if (s->synced < 0)
+                    fputc('?', out);
+                else
+                    fprintf(out, "%d", s->synced);
+                p += 7;
+                continue;
+            }
+            if (strncmp(p, "{state}", 7) == 0) {
+                fputs(s->state, out);
+                p += 6;
+                continue;
+            }
         }
-        unlink(mark); /* stale: a check died mid-flight */
+        fputc(*p, out);
     }
+}
 
-    time_t mtime = 0;
-    int count = count_lines(list, &mtime);
-    if (count < 0) {
-        emit("", "No update check has run yet", "unknown");
-        return 0;
+static void json_escape(FILE *out, const char *s) {
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"': fputs("\\\"", out); break;
+        case '\\': fputs("\\\\", out); break;
+        case '\n': fputs("\\n", out); break;
+        case '\r': fputs("\\r", out); break;
+        case '\t': fputs("\\t", out); break;
+        default:
+            if (c < 0x20)
+                fprintf(out, "\\u%04x", c);
+            else
+                fputc(c, out); /* UTF-8 bytes pass through */
+        }
     }
+}
 
+static void write_tooltip(FILE *tb, const struct snapshot *s) {
     char checked[64] = "";
     struct tm tmv;
-    if (localtime_r(&mtime, &tmv))
+    if (s->checked && localtime_r(&s->checked, &tmv))
         strftime(checked, sizeof checked, "%a %b %d %I:%M %p", &tmv);
 
-    int glsa = read_int_file(sec);
-    int age = tree_age_days();
-
-    char *tip = NULL;
-    size_t tipn = 0;
-    FILE *tb = open_memstream(&tip, &tipn);
-
-    if (count == 0)
+    if (s->checking) fputs("Checking for updates\xe2\x80\xa6\n", tb);
+    if (s->count < 0)
+        fputs("No update check has run yet", tb);
+    else if (s->count == 0)
         fprintf(tb, "System up to date \xe2\x80\xa2 checked %s", checked);
     else
-        fprintf(tb, "%d update%s pending \xe2\x80\xa2 checked %s", count,
-                count == 1 ? "" : "s", checked);
+        fprintf(tb, "%d update%s pending \xe2\x80\xa2 checked %s", s->count,
+                s->count == 1 ? "" : "s", checked);
+    if (s->glsa > 0)
+        fprintf(tb, "\n%d unresolved GLSA%s (run glsa-check)", s->glsa,
+                s->glsa == 1 ? "" : "s");
+    if (s->synced >= STALE_DAYS)
+        fprintf(tb, "\nportage tree synced %d days ago \xe2\x80\x94 sync to refresh",
+                s->synced);
 
-    if (glsa > 0)
-        fprintf(tb, "\n\xef\x80\xa3 %d unresolved GLSA%s (run glsa-check)", glsa,
-                glsa == 1 ? "" : "s");
-    if (age >= STALE_DAYS)
-        fprintf(
-            tb,
-            "\n\xef\x80\x97 portage tree synced %d day%s ago \xe2\x80\x94 sync to refresh",
-            age, age == 1 ? "" : "s");
-
-    if (count > 0) {
-        fputs("\n\n", tb);
+    if (s->count > 0) {
+        char list[4096];
+        cache_path(list, sizeof list, "list");
         FILE *lf = fopen(list, "r");
         if (lf) {
+            fputs("\n", tb);
             char *line = NULL;
             size_t cap = 0;
             int shown = 0;
-            while (getline(&line, &cap, lf) != -1) {
-                if (shown++ >= PREVIEW) break;
-                fputs("  ", tb);
+            while (getline(&line, &cap, lf) != -1 && shown++ < PREVIEW) {
+                fputs("\n  ", tb);
+                line[strcspn(line, "\n")] = '\0';
                 fputs(line, tb);
             }
             free(line);
             fclose(lf);
-            if (count > PREVIEW)
+            if (s->count > PREVIEW)
                 fprintf(tb,
-                        "  \xe2\x80\xa6"
+                        "\n  \xe2\x80\xa6"
                         "and %d more",
-                        count - PREVIEW);
+                        s->count - PREVIEW);
         }
     }
-    fclose(tb);
+}
 
-    if (count == 0) {
-        emit("", tip, "updated");
+/* One output line, newline-terminated, in a malloc'd string. */
+static char *render(const char *fmt, int json) {
+    struct snapshot s;
+    take_snapshot(&s);
+    char *buf = NULL, *text = NULL, *tip = NULL;
+    size_t n = 0, tn = 0, pn = 0;
+
+    FILE *tf = open_memstream(&text, &tn);
+    expand(tf, fmt, &s);
+    fclose(tf);
+
+    FILE *out = open_memstream(&buf, &n);
+    if (!json) {
+        fputs(text, out);
     } else {
-        char text[64];
-        snprintf(text, sizeof text, "%s %d", ICON, count);
-        emit(text, tip, "pending");
+        FILE *tb = open_memstream(&tip, &pn);
+        write_tooltip(tb, &s);
+        fclose(tb);
+        fputs("{\"text\":\"", out);
+        json_escape(out, text);
+        fputs("\",\"tooltip\":\"", out);
+        json_escape(out, tip);
+        fprintf(out, "\",\"class\":\"%s\",\"alt\":\"%s\"}", s.state, s.state);
+        free(tip);
     }
-    free(tip);
+    fputc('\n', out);
+    fclose(out);
+    free(text);
+    return buf;
+}
+
+/* ---- commands ------------------------------------------------------------ */
+
+static int cmd_status(const char *fmt, int json, int autocheck, int notify) {
+    if (autocheck && out_of_date()) spawn_check(notify);
+    char *line = render(fmt, json);
+    fputs(line, stdout);
+    free(line);
     return 0;
 }
 
-/* ---- upgrade ------------------------------------------------------------- */
+/* Has whoever reads our stdout closed it? A pipe whose read end is gone polls
+ * as POLLERR on the write end, so this notices a bar reload at once instead of
+ * at the next write. A terminal or file never reports it. */
+static int reader_gone(void) {
+    struct pollfd p = {.fd = STDOUT_FILENO, .events = 0};
+    return poll(&p, 1, 0) > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL));
+}
 
-static int cmd_upgrade(int progress, int notify) {
+static int cmd_watch(const char *fmt, int json, int autocheck, int notify) {
+    char *last = NULL;
+    for (;;) {
+        if (autocheck && out_of_date()) spawn_check(notify);
+        char *line = render(fmt, json);
+        if (!last || strcmp(line, last) != 0) {
+            fputs(line, stdout);
+            if (fflush(stdout) != 0) return 0; /* the bar went away */
+            free(last);
+            last = line;
+        } else {
+            free(line);
+        }
+        if (reader_gone()) return 0; /* bar reloaded: don't linger until next change */
+        sleep((unsigned)WATCH_TICK);
+    }
+}
+
+static int cmd_list(void) {
+    char list[4096];
+    cache_path(list, sizeof list, "list");
+    FILE *f = fopen(list, "r");
+    if (!f) {
+        fputs("eupdates: no update check has run yet\n", stderr);
+        return 1;
+    }
+    char buf[4096];
+    size_t k;
+    while ((k = fread(buf, 1, sizeof buf, f)) > 0)
+        fwrite(buf, 1, k, stdout);
+    fclose(f);
+    return 0;
+}
+
+static int cmd_upgrade(int notify) {
     const char *term = getenv("TERMINAL");
     if (!term || !*term) term = "xterm";
     pid_t pid = fork();
@@ -471,44 +632,48 @@ static int cmd_upgrade(int progress, int notify) {
         int st;
         waitpid(pid, &st, 0);
     }
-    /* No settle: the emerge this just ran is over, and the user is watching. */
-    return cmd_check(progress, notify, 0);
+    return run_check(1, notify);
 }
 
 /* ---- main ---------------------------------------------------------------- */
 
 static void usage(FILE *out, const char *prog) {
     fprintf(out,
-            "Usage: %s [command]\n"
+            "Usage: %s [command] [options]\n"
             "\n"
-            "Count pending Gentoo (portage) @world updates for status bars.\n"
+            "Count pending Gentoo (portage) @world updates, for any status bar.\n"
             "Resolves the already-synced local tree only; never contacts a mirror.\n"
             "\n"
             "Commands:\n"
-            "  status    emit waybar JSON from the cache (default; instant)\n"
-            "  check     resolve @world, refresh the cache, signal waybar\n"
+            "  status    print the count once from the cache (default; instant)\n"
+            "  watch     keep running; print a new line whenever the output changes\n"
+            "  check     resolve @world now and refresh the cache\n"
+            "  list      print the cached list of pending packages\n"
             "  upgrade   run the upgrade in $TERMINAL, then re-check\n"
             "\n"
-            "Options (for check / upgrade):\n"
-            "  --progress     show a \"checking\" state in the bar while resolving\n"
-            "  --settle SECS  wait for portage to be idle SECS before resolving\n"
+            "Options:\n"
+            "  --format TPL   output template; fields {count} {glsa} {synced} {state}\n"
+            "                 (default: {count})\n"
+            "  --json         one JSON object per line: text, tooltip, class, alt\n"
+            "  --no-auto      never start a check on its own (run `check` yourself)\n"
             "  --notify       desktop-notify when the pending count changes\n"
             "  --no-notify    suppress notifications (overrides EUPDATES_NOTIFY)\n"
             "  -h, --help     show this help and exit\n"
             "  -V, --version  show version and exit\n"
             "\n"
             "Environment:\n"
-            "  EUPDATES_NOTIFY          notify on change when non-empty and not \"0\"\n"
-            "  EUPDATES_ICON            notification icon: theme name or image path\n"
-            "  TERMINAL                 terminal for `upgrade` (default: xterm)\n"
-            "  EUPDATES_WAYBAR_SIGNAL   SIGRTMIN+N waybar refresh signal (default: 8)\n"
-            "  XDG_CACHE_HOME           cache location (default: ~/.cache/eupdates)\n",
+            "  EUPDATES_AUTO      0 = same as --no-auto\n"
+            "  EUPDATES_MAX_AGE   re-check at least every N hours (default: 24)\n"
+            "  EUPDATES_NOTIFY    notify on change when non-empty and not \"0\"\n"
+            "  EUPDATES_ICON      notification icon: theme name or image path\n"
+            "  TERMINAL           terminal for `upgrade` (default: xterm)\n"
+            "  XDG_CACHE_HOME     cache location (default: ~/.cache/eupdates)\n",
             prog);
 }
 
 int main(int argc, char **argv) {
-    const char *cmd = NULL;
-    int progress = 0, cli_notify = 0, cli_no_notify = 0, settle_secs = 0;
+    const char *cmd = NULL, *fmt = DEFAULT_FORMAT;
+    int json = 0, no_auto = 0, cli_notify = 0, cli_no_notify = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
@@ -519,20 +684,16 @@ int main(int argc, char **argv) {
             printf("eupdates %s\n", EUPDATES_VERSION);
             return 0;
         }
-        if (strcmp(a, "--progress") == 0) {
-            progress = 1;
-        } else if (strcmp(a, "--settle") == 0) {
+        if (strcmp(a, "--format") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "eupdates: --settle requires SECONDS\n");
+                fputs("eupdates: --format requires a template\n", stderr);
                 return 2;
             }
-            char *end;
-            long v = strtol(argv[++i], &end, 10);
-            if (*end || v < 0 || v > 86400) {
-                fprintf(stderr, "eupdates: --settle: bad value '%s'\n", argv[i]);
-                return 2;
-            }
-            settle_secs = (int)v;
+            fmt = argv[++i];
+        } else if (strcmp(a, "--json") == 0) {
+            json = 1;
+        } else if (strcmp(a, "--no-auto") == 0) {
+            no_auto = 1;
         } else if (strcmp(a, "--notify") == 0) {
             cli_notify = 1;
         } else if (strcmp(a, "--no-notify") == 0) {
@@ -550,10 +711,15 @@ int main(int argc, char **argv) {
     }
     if (!cmd) cmd = "status";
 
-    int notify = notify_enabled(cli_notify, cli_no_notify);
-    if (strcmp(cmd, "status") == 0) return cmd_status();
-    if (strcmp(cmd, "check") == 0) return cmd_check(progress, notify, settle_secs);
-    if (strcmp(cmd, "upgrade") == 0) return cmd_upgrade(progress, notify);
+    int notify = !cli_no_notify && (cli_notify || env_flag("EUPDATES_NOTIFY", 0));
+    int autocheck = !no_auto && env_flag("EUPDATES_AUTO", 1);
+    signal(SIGPIPE, SIG_DFL);
+
+    if (strcmp(cmd, "status") == 0) return cmd_status(fmt, json, autocheck, notify);
+    if (strcmp(cmd, "watch") == 0) return cmd_watch(fmt, json, autocheck, notify);
+    if (strcmp(cmd, "check") == 0) return run_check(1, notify);
+    if (strcmp(cmd, "list") == 0) return cmd_list();
+    if (strcmp(cmd, "upgrade") == 0) return cmd_upgrade(notify);
     fprintf(stderr, "eupdates: unknown command '%s'\n", cmd);
     usage(stderr, argv[0]);
     return 2;
