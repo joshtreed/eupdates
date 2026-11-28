@@ -16,6 +16,41 @@ jobs:
       - name: tests (${{ matrix.cc }})
         run: make test CC=${{ matrix.cc }}
 
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests under ASan + UBSan
+        # Reports go to files: some tests discard stderr, and background
+        # children's reports would otherwise be lost while the suite passes.
+        run: |
+          mkdir -p "$RUNNER_TEMP/san"
+          export ASAN_OPTIONS="log_path=$RUNNER_TEMP/san/asan:fast_unwind_on_malloc=0"
+          export UBSAN_OPTIONS="log_path=$RUNNER_TEMP/san/ubsan:print_stacktrace=1"
+          make test CC="gcc -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+      - name: no sanitizer reports
+        if: always()
+        run: |
+          if ls "$RUNNER_TEMP"/san/* >/dev/null 2>&1; then cat "$RUNNER_TEMP"/san/*; exit 1; fi
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y scdoc
+      - name: staged install, the way an ebuild runs it
+        run: |
+          make PREFIX=/usr CFLAGS="-O2 -pipe" LDFLAGS="-Wl,--as-needed"
+          make install PREFIX=/usr DESTDIR="$RUNNER_TEMP/image"
+      - name: expected files, nothing else
+        run: |
+          cd "$RUNNER_TEMP/image"
+          printf '%s\n' ./usr/bin/eupdates ./usr/share/man/man1/eupdates.1 > ../want
+          find . -type f | sort | diff ../want -
+          test -x usr/bin/eupdates
+          usr/bin/eupdates --version
+          man -l usr/share/man/man1/eupdates.1 >/dev/null
+
   musl:
     runs-on: ubuntu-latest
     container: alpine:latest
