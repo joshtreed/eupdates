@@ -1,8 +1,5 @@
 # eupdates
 
-[![ci](https://github.com/joshtreed/eupdates/actions/workflows/ci.yml/badge.svg)](https://github.com/joshtreed/eupdates/actions/workflows/ci.yml)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
-
 Shows how many Gentoo packages have pending updates, in any status bar.
 
 ![eupdates in waybar, with its tooltip open](doc/screenshot.png)
@@ -103,11 +100,6 @@ and it doesn't retry until something changes.
 
 To schedule checks yourself, use `--no-auto` (or `EUPDATES_AUTO=0`) and run
 `eupdates check` from cron or a timer.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in
-[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
