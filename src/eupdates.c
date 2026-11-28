@@ -1360,15 +1360,17 @@ static int cmd_watch(const char *fmt, int json, int autocheck, int notify) {
         char *line = render(fmt, json);
         if (!last || strcmp(line, last) != 0) {
             fputs(line, stdout);
-            if (fflush(stdout) != 0) return 0; /* the bar went away */
             free(last);
             last = line;
+            if (fflush(stdout) != 0) break; /* the bar went away */
         } else {
             free(line);
         }
-        if (reader_gone()) return 0; /* bar reloaded: don't linger until next change */
+        if (reader_gone()) break; /* bar reloaded: don't linger until next change */
         sleep((unsigned)WATCH_TICK);
     }
+    free(last);
+    return 0;
 }
 
 static int cmd_list(void) {
